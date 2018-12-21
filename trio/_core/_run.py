@@ -1209,6 +1209,8 @@ class Runner:
 ################################################################
 
 
+from ._inspect import GuessContextsInstrument
+
 def run(
     async_fn,
     *args,
@@ -1298,6 +1300,7 @@ def run(
     if clock is None:
         clock = SystemClock()
     instruments = list(instruments)
+    instruments.append(GuessContextsInstrument())
     io_manager = TheIOManager()
     system_context = copy_context()
     system_context.run(current_async_library_cvar.set, "trio")
