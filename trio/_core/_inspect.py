@@ -1,16 +1,40 @@
-import ctypes, dis, gc, inspect, sys
+import collections, ctypes, dis, gc, inspect, math, sys
 from types import FrameType
-from typing import List
-from . import _run
+from typing import List, Tuple, Optional, Iterator
+from . import _run, _ki
 
 
-def _contexts_visible_in_frame(frame: FrameType) -> List[object]:
+def _contexts_active_in_frame(frame: FrameType) -> List[Tuple[object, Optional[str], int]]:
     """Inspects the frame object ``frame`` to try to determine which context
-    managers are currently active; returns a list from outermost to innermost.
-    The frame must be suspended at a yield or await.
+    managers are currently active; returns a list of tuples
+    (manager, name, start_line) describing the active context managers
+    from outermost to innermost. ``manager`` is the context manager object.
+    ``name`` is the name of the local variable that the result of its
+    ``__enter__`` or ``__aenter__`` method was assigned to. ``start_line``
+    is the line number on which the ``with`` or ``async with`` block began.
+
+    The frame must be suspended at a yield or await. Raises AssertionError
+    if we couldn't make sense of this frame.
     """
 
     assert sys.implementation.name == "cpython"
+
+    # Bytecode analysis to figure out where each 'with' or 'async with'
+    # block starts, so we can look up the extra info based on the bytecode
+    # offset of the WITH_CLEANUP_START instruction later on.
+    with_block_info: Dict[int, Tuple[Optional[str], int]] = {}
+    insns = list(dis.Bytecode(frame.f_code))
+    current_line = frame.f_code.co_firstlineno
+    for insn, inext in zip(insns[:-1], insns[1:]):
+        if insn.starts_line is not None:
+            current_line = insn.starts_line
+        if insn.opname in ("SETUP_WITH", "SETUP_ASYNC_WITH"):
+            if inext.opname == "STORE_FAST":
+                store_to = inext.argval
+            else:
+                store_to = None
+            cleanup_offset = insn.argval
+            with_block_info[cleanup_offset] = (store_to, current_line)
 
     # This is the layout of the start of a frame object. It has a couple
     # fields we can't access from Python, especially f_valuestack and
@@ -97,7 +121,9 @@ def _contexts_visible_in_frame(frame: FrameType) -> List[object]:
         ]
 
     active_context_exit_ids = []
+    active_context_exit_offsets = []
     coro_aexiting_now_id = None
+    coro_aexiting_now_offset = None
 
     blockstack_offset = localsplus_offset - 20 * ctypes.sizeof(PyTryBlock)
     f_iblock = ctypes.c_int.from_address(id(frame) + blockstack_offset - 8)
@@ -132,6 +158,7 @@ def _contexts_visible_in_frame(frame: FrameType) -> List[object]:
             # Yup. Still fully inside the block; use b_level to find the
             # __exit__ or __aexit__ method
             active_context_exit_ids.append(stack[block.b_level - 1])
+            active_context_exit_offsets.append(block.b_handler)
 
         blockstack_offset += ctypes.sizeof(PyTryBlock)
 
@@ -146,6 +173,7 @@ def _contexts_visible_in_frame(frame: FrameType) -> List[object]:
         dis.opmap["YIELD_FROM"]
     ]:
         coro_aexiting_now_id = stack[-1]
+        coro_aexiting_now_offset = frame.f_lasti - 4
 
     # Now active_context_exit_ids contains (in theory) the addresses
     # of the __exit__/__aexit__ callables for each context manager
@@ -155,23 +183,31 @@ def _contexts_visible_in_frame(frame: FrameType) -> List[object]:
     # security by getting the actual objects out of gc.get_referents()
     # rather than just casting the addresses.
 
-    object_from_id_map = {id(obj): obj for obj in gc.get_referents(frame)
-                          if id(obj) in active_context_exit_ids
-                          or id(obj) == coro_aexiting_now_id}
+    object_from_id_map = {
+        id(obj): obj
+        for obj in gc.get_referents(frame)
+        if id(obj) in active_context_exit_ids
+        or id(obj) == coro_aexiting_now_id
+    }
     assert len(object_from_id_map) == len(active_context_exit_ids) + (
         coro_aexiting_now_id is not None
     )
 
-    active_contexts = []
-    for ident in active_context_exit_ids:
-        active_contexts.append(object_from_id_map[ident].__self__)
+    active_context_info = []
+    for ident, offset in zip(active_context_exit_ids, active_context_exit_offsets):
+        active_context_info.append(
+            (object_from_id_map[ident].__self__, *with_block_info[offset])
+        )
 
     if coro_aexiting_now_id is not None:
         # Assume the context manager is the 1st coroutine argument.
         coro = object_from_id_map[coro_aexiting_now_id]
         args = inspect.getargvalues(coro.cr_frame)
-        active_contexts.append(args.locals[args.args[0]])
-    return active_contexts
+        active_context_info.append(
+            (args.locals[args.args[0]], *with_block_info[coro_aexiting_now_offset])
+        )
+
+    return active_context_info
 
 
 def _frame_and_next(awaitable):
@@ -193,8 +229,7 @@ def _frame_and_next(awaitable):
         # these refer to only one other object, the underlying coroutine
         for referent in gc.get_referents(awaitable):
             return _frame_and_next(referent)
-    raise RuntimeError(f"Not sure what to do with a {awaitable!r}")
-    #return None, None
+    return None, None
 
 
 def _frames_suspended_in_task(task):
@@ -215,32 +250,109 @@ def _frames_suspended_in_task(task):
     return frames
 
 
-def _map_trio_scopes_to_toplevel_contexts(trio_scopes, toplevel_contexts):
-    refers_to_trio_scope = collections.OrderedDict()
-    referenced_by_toplevel_context = collections.OrderedDict()
-    # ...
+def _match_trio_scopes_to_contexts(trio_scopes, toplevel_contexts):
+    trio_scope_to_context = {}
+    unmatched_trio_scopes = set(id(scope) for scope in trio_scopes)
+    to_visit = collections.deque(
+        (ctx, ctx, 0) for ctx in toplevel_contexts
+    )
+    while unmatched_trio_scopes and to_visit:
+        obj, root, depth = to_visit.popleft()
+        if id(obj) in unmatched_trio_scopes:
+            trio_scope_to_context[id(obj)] = root
+            unmatched_trio_scopes.remove(id(obj))
+        if depth < 5:
+            to_visit.extend(
+                (referent, root, depth + 1)
+                for referent in gc.get_referents(obj)
+            )
+    return trio_scope_to_context
 
 
-def _dump_traceback_with_trio_contexts(task):
-    frames = _frames_suspended_in_task(task)
-    for frame in frames:
+def format_task_tree(
+    root: Optional[_run.Task] = None, prefix: str = ""
+) -> Iterator[str]:
+
+    if root is None:
+        root = _run.current_root_task()
+        if root is None:
+            return
+    yield f"{prefix}task '{root.name}':"
+    if prefix.endswith("-- "):
+        prefix = prefix[:-3] + "   "
+
+    frames = _frames_suspended_in_task(root)
+    contexts_per_frame = [_contexts_active_in_frame(frame) for frame in frames]
+    all_contexts = [ctx for sublist in contexts_per_frame for ctx, *info in sublist]
+    all_trio_scopes = collections.deque()
+
+    if root.parent_nursery is not None:
+        inherited_from_parent = len(root.parent_nursery._cancel_stack)
+    else:
+        inherited_from_parent = 0
+    cancel_scopes = root._cancel_stack[inherited_from_parent:][::-1]
+    for nursery in root.child_nurseries:
+        while cancel_scopes[-1] is not nursery.cancel_scope:
+            all_trio_scopes.append(cancel_scopes.pop())
+        # don't include the nursery's cancel scope since we print it
+        # as part of the nursery
+        cancel_scopes.pop()
+        all_trio_scopes.append(nursery)
+    all_trio_scopes.extend(cancel_scopes[::-1])
+
+    scope_map = _match_trio_scopes_to_contexts(all_trio_scopes, all_contexts)
+
+    def format_trio_scope(scope, filename, info) -> Iterator[str]:
+        nonlocal prefix
+        if info is not None:
+            varname, lineno = info
+        else:
+            varname, lineno, filename = None, "??", "??"
+        nameinfo = f"`{varname}' " if varname is not None else ""
+        where = f"{nameinfo}at {filename}:{lineno}"
+
+        def cancel_scope_info(cancel_scope):
+            bits = []
+            if cancel_scope.cancel_called:
+                bits.append("cancelled")
+            elif cancel_scope.deadline != math.inf:
+                bits.append(
+                    "timeout in {:.2f}sec".format(
+                        cancel_scope.deadline - _run.current_time()
+                    )
+                )
+            if cancel_scope.shield:
+                bits.append("shielded")
+            return (": " if bits else "") + ", ".join(bits)
+
+        if type(scope).__name__ == "CancelScope":
+            yield f"{prefix}cancel scope {where}" + cancel_scope_info(scope)
+
+        elif type(scope).__name__ == "Nursery":
+            yield f"{prefix}nursery {where}" + cancel_scope_info(scope.cancel_scope)
+            for task in scope.child_tasks:
+                yield from format_task_tree(task, prefix + "|-- ")
+            yield f"{prefix}+-- nested child:"
+            prefix += "    "
+
+        else:
+            yield f"{prefix}<!> unhandled {scope!r} {where}"
+
+    for frame, contexts_info in zip(frames, contexts_per_frame):
         filename, lineno, function, _, _ = inspect.getframeinfo(frame, context=0)
-        for context in _contexts_visible_in_frame(frame):
-            # ...
-            pass
-
-
-class GuessContextsInstrument:
-    def task_scheduled(self, task):
-      try:
-        frames = _frames_suspended_in_task(task)
-        for frame in frames:
-            filename, lineno, function, _, _ = inspect.getframeinfo(frame, context=0)
-            for context in _contexts_visible_in_frame(frame):
-                pass #print(f"    {context!r}")
-            #print(f"{function} at {filename}:{lineno}")
-        if frames:
-            pass #print("---")
-      except:
-        import traceback; traceback.print_exc()
-        import pdb; pdb.pm()
+        context_to_info = {id(context): info for context, *info in contexts_info}
+        while all_trio_scopes:
+            context = scope_map.get(id(all_trio_scopes[0]))
+            if context is not None and id(context) not in context_to_info:
+                # This context belongs to the next frame -- don't print it
+                # in this frame
+                break
+            yield from format_trio_scope(
+                all_trio_scopes.popleft(), filename, context_to_info.get(id(context))
+            )
+        #argvalues = inspect.formatargvalues(*inspect.getargvalues(frame))
+        argvalues = inspect.getargvalues(frame)
+        if argvalues.args and argvalues.args[0] == "self":
+            function = f"{type(argvalues.locals['self']).__name__}.{function}"
+        yield f"{prefix}{function} at {filename}:{lineno}"
+    yield prefix
