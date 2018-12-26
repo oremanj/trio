@@ -120,9 +120,12 @@ class NullStream(HalfCloseableStream):
     in a function defined to return a stream of data, it reduces special-casing
     if there's no data that needs to be provided.
 
-    Trying to read after closing, or write after closing or :meth:`send_eof`,
-    will raise :exc:`ClosedResourceError`, even though those operations
-    are otherwise no-ops.
+    Trying to read after closing, or write after closing or
+    :meth:`~trio.abc.HalfCloseableStream.send_eof`, will raise
+    :exc:`ClosedResourceError`, even though those operations are
+    otherwise no-ops.
+
+    A synchronous ``close()`` is provided in addition to the usual ``aclose()``.
     """
 
     def __init__(self) -> None:
@@ -138,8 +141,11 @@ class NullStream(HalfCloseableStream):
             closed = "open"
         return "<trio.NullStream: {}>".format(closed)
 
-    async def aclose(self) -> None:
+    def close(self) -> None:
         self._read_closed = self._write_closed = True
+
+    async def aclose(self) -> None:
+        self.close()
         await _core.checkpoint()
 
     async def receive_some(self, max_bytes: int) -> bytes:

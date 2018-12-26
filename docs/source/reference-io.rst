@@ -667,7 +667,7 @@ below. See the below discussion of :ref:`options for starting
 subprocesses <subprocess-options>` for the gory details.
 
 
-.. _subprocess-quoting
+.. _subprocess-quoting:
 
 Specifying the command to run
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -714,15 +714,16 @@ string on UNIX platforms with ``shell=True``, a Windows-quoted
 string on Windows platforms with ``shell=False``, and two levels
 of Windows-quoted string on Windows platforms with ``shell=True``.
 The Python standard library doesn't provide any facility for turning
-a sequence of arguments into a Windows-quoted string, so it's easier
+a Windows-quoted string into a sequence of arguments, so it's easier
 to standardize on POSIX quotes.
 
 .. list-table:: Summary of quoting behavior
    :widths: auto
+   :width: 100%
    :header-rows: 1
 
    * - Platform
-     - ``shell`` option
+     - ``shell=``
      - Sequence behavior
      - String behavior
      - ... with ``local_quotes=True``
@@ -738,14 +739,14 @@ to standardize on POSIX quotes.
      - Use as-is
    * - Windows
      - False
-     - Quote using Windows rules
-     - :func:`shlex.split` then quote using Windows rules
+     - Windows-quote
+     - :func:`shlex.split` then Windows-quote
      - Use as-is
    * - Windows
      - True
-     - Quote twice using Windows rules
-     - :func:`shlex.split` then quote twice using Windows rules
-     - Quote once using Windows rules
+     - Windows-quote twice
+     - :func:`shlex.split` then Windows-quote twice
+     - Windows-quote once
 
 
 .. _subprocess-options:
@@ -778,81 +779,42 @@ The Trio-specific boolean option ``local_quotes``, described
 Running a process and waiting for it to finish
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
--The basic interface for running a subprocess start-to-finish is
--:func:`trio.subprocess.run`.  It always waits for the subprocess to
--exit before returning, so there's no need to worry about leaving
--a process running by mistake after you've gone on to do other things.
--:func:`~trio.subprocess.run` can supply input or read output from
--the subprocess, and can optionally throw an exception if the subprocess
--exits with a failure indication.
+The basic interface for running a subprocess start-to-finish is
+:func:`trio.run_process`.  It always waits for the subprocess to exit
+before returning, so there's no need to worry about leaving a process
+running by mistake after you've gone on to do other things.
+:func:`~trio.run_process` is similar to the standard library
+:func:`subprocess.run` function, but tries to have safer defaults:
+with no options, the subprocess's input is provided and its outputs
+are captured by the parent Trio process rather than connecting them
+to the user's terminal, and a failure in the subprocess will be propagated
+as a :exc:`subprocess.CalledProcessError` exception. Of course, different
+behavior is available for the cases where it's needed.
 
-We're `working on <https://github.com/python-trio/trio/pull/791>`
-figuring out the best API for common higher-level subprocess operations.
-In the meantime, you can implement something like the standard library
-:func:`subprocess.run` in terms of :class:`trio.subprocess.Process`
-as follows::
+.. autofunction:: trio.run_process
 
-    async def run(
-        command, *, input=None, capture_output=False, **options
-    ):
-        if input is not None:
-            options['stdin'] = subprocess.PIPE
-        if capture_output:
-            options['stdout'] = options['stderr'] = subprocess.PIPE
+If you want to run a subprocess under an interactive user's control,
+rather than under the parent Trio process's control,
+:func:`~trio.run_process`'s defaults can be slightly cumbersome. Trio
+provides :func:`~trio.delegate_to_process` to cover this case.
 
-        stdout_chunks = []
-        stderr_chunks = []
-
-        async with trio.subprocess.Process(command, **options) as proc:
-
-            async def feed_input():
-                async with proc.stdin:
-                    if input:
-                        try:
-                            await proc.stdin.send_all(input)
-                        except trio.BrokenResourceError:
-                            pass
-
-            async def read_output(stream, chunks):
-                async with stream:
-                    while True:
-                        chunk = await stream.receive_some(32768)
-                        if not chunk:
-                            break
-                        chunks.append(chunk)
-
-            async with trio.open_nursery() as nursery:
-                if proc.stdin is not None:
-                    nursery.start_soon(feed_input)
-                if proc.stdout is not None:
-                    nursery.start_soon(read_output, proc.stdout, stdout_chunks)
-                if proc.stderr is not None:
-                    nursery.start_soon(read_output, proc.stderr, stderr_chunks)
-                await proc.wait()
-
-        stdout = b"".join(stdout_chunks) if proc.stdout is not None else None
-        stderr = b"".join(stderr_chunks) if proc.stderr is not None else None
-
-        if proc.returncode:
-            raise subprocess.CalledProcessError(
-                proc.returncode, proc.args, output=stdout, stderr=stderr
-            )
-        else:
-            return subprocess.CompletedProcess(
-                proc.args, proc.returncode, stdout, stderr
-            )
+.. autofunction:: trio.delegate_to_process
 
 
 Interacting with a process as it runs
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-You can spawn a subprocess by creating an instance of
-:class:`trio.subprocess.Process` and then interact with it using its
-:attr:`~trio.subprocess.Process.stdin`,
-:attr:`~trio.subprocess.Process.stdout`, and/or
-:attr:`~trio.subprocess.Process.stderr` streams.
+:func:`open_stream_to_process` returns a context manager in which the
+user can interact with the subprocess's standard input and output
+using a Trio stream.
 
-.. autoclass:: trio.subprocess.Process
+You can spawn a subprocess by creating an instance of
+:class:`trio.Process` and then interact with it using its
+:attr:`~trio.Process.stdin`,
+:attr:`~trio.Process.stdout`, and/or
+:attr:`~trio.Process.stderr` streams.
+
+.. autoclass:: trio.Process
    :members:
 
 
@@ -860,14 +822,14 @@ Differences from the standard library
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 * All arguments to the constructor of
-  :class:`~trio.subprocess.Process`, except the command to run, must be
+  :class:`~trio.Process`, except the command to run, must be
   passed using keywords.
 
 * :func:`~subprocess.call`, :func:`~subprocess.check_call`, and
   :func:`~subprocess.check_output` are not provided.
 
 * :meth:`~subprocess.Popen.communicate` is not provided as a method on
-  :class:`~trio.subprocess.Process` objects; use a higher-level
+  :class:`~trio.Process` objects; use a higher-level
   function instead, or write the loop yourself if
   you have unusual needs. :meth:`~subprocess.Popen.communicate` has
   quite unusual cancellation behavior in the standard library (on some
@@ -875,22 +837,22 @@ Differences from the standard library
   the child process even after the timeout has expired) and we wanted
   to provide an interface with fewer surprises.
 
-* :meth:`~trio.subprocess.Process.wait` is an async function that does
+* :meth:`~trio.Process.wait` is an async function that does
   not take a ``timeout`` argument; combine it with
   :func:`~trio.fail_after` if you want a timeout.
 
 * Text I/O is not supported: you may not use the
-  :class:`~trio.subprocess.Process` constructor arguments
+  :class:`~trio.Process` constructor arguments
   ``universal_newlines`` (or its 3.7+ alias ``text``), ``encoding``,
   or ``errors``.
 
-* :attr:`~trio.subprocess.Process.stdin` is a :class:`~trio.abc.SendStream` and
-  :attr:`~trio.subprocess.Process.stdout` and :attr:`~trio.subprocess.Process.stderr`
+* :attr:`~trio.Process.stdin` is a :class:`~trio.abc.SendStream` and
+  :attr:`~trio.Process.stdout` and :attr:`~trio.Process.stderr`
   are :class:`~trio.abc.ReceiveStream`\s, rather than file objects. The
-  :class:`~trio.subprocess.Process` constructor argument ``bufsize`` is
+  :class:`~trio.Process` constructor argument ``bufsize`` is
   not supported since there would be no file object to pass it to.
 
-* :meth:`~trio.subprocess.Process.aclose` (and thus also
+* :meth:`~trio.Process.aclose` (and thus also
   ``__aexit__``) behave like the standard :class:`~subprocess.Popen`
   context manager exit (close pipes to the process, then wait for it
   to exit), but add additional behavior if cancelled: kill the process
