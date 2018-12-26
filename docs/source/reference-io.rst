@@ -173,7 +173,7 @@ Generic stream tools
 
 Trio currently provides a generic helper for writing servers that
 listen for connections using one or more
-:class:`~trio.abc.Listener`\s, and a generic utility class for working
+:class:`~trio.abc.Listener`\s, and two generic utility classes for working
 with streams. And if you want to test code that's written against the
 streams interface, you should also check out :ref:`testing-streams` in
 :mod:`trio.testing`.
@@ -182,6 +182,9 @@ streams interface, you should also check out :ref:`testing-streams` in
 
 .. autoclass:: StapledStream
    :members:
+   :show-inheritance:
+
+.. autoclass:: NullStream
    :show-inheritance:
 
 
@@ -638,24 +641,111 @@ Asynchronous file objects
       The underlying synchronous file object.
 
 
-.. module:: trio.subprocess
 .. _subprocess:
 
-Spawning subprocesses with :mod:`trio.subprocess`
--------------------------------------------------
+Spawning subprocesses
+---------------------
 
-The :mod:`trio.subprocess` module provides support for spawning
-other programs, communicating with them via pipes, sending them signals,
-and waiting for them to exit. Its interface is based on the
-:mod:`subprocess` module in the standard library; differences
-are noted below.
+Trio provides support for spawning other programs as subprocesses,
+communicating with them via pipes, sending them signals, and waiting
+for them to exit. The interface for doing so consists of two layers.
+The :class:`~trio.Process` class provides an interface that mirrors
+the standard :class:`subprocess.Popen`, with async methods and with
+Trio stream wrappers for the process's input and output. Built atop
+:class:`~trio.Process` are the convenience functions
+:func:`~trio.run_process`, :func:`~trio.delegate_to_process`, and
+:func:`~trio.open_stream_to_process`.
 
-The constants and exceptions from the standard :mod:`subprocess`
-module are re-exported by :mod:`trio.subprocess` unchanged.
-So, if you like, you can say ``from trio import subprocess``
-and continue referring to ``subprocess.PIPE``,
-:exc:`subprocess.CalledProcessError`, and so on, in the same
-way you would in synchronous code.
+In all of these interfaces, the command to run and its arguments
+are specified as the sole positional argument, while keywords
+determine how the subprocess's inputs and outputs will be set up
+and other aspects of the environment in which it will run.
+Almost all of the keyword arguments accepted by the standard library
+:class:`subprocess.Popen` class are supported with their usual semantics,
+and can be passed wherever you see ``**options`` in the API documentation
+below. See the below discussion of :ref:`options for starting
+subprocesses <subprocess-options>` for the gory details.
+
+
+.. _subprocess-quoting
+
+Specifying the command to run
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The command to run and its arguments may be passed to any of Trio's
+subprocess APIs as either a sequence of strings or a string.
+
+* If a sequence is passed, the first element in the sequence specifies
+  the command to run and the remaining elements specify its arguments,
+  one argument per element. This form is recommended because it
+  avoids potential quoting pitfalls; for example, you can run
+  ``["cp", "-f", source_file, dest_file]`` without worrying about
+  whether ``source_file`` or ``dest_file`` contains spaces.
+
+* If a string is passed, it is split into words following POSIX
+  shell quoting rules (the same used by :func:`shlex.split`),
+  even on Windows. These can be summarized as:
+
+  * Outside of quotes, an unescaped backslash escapes the following
+    character (removes its special meaning, if any) and does not
+    appear in the output.
+
+  * Outside of quotes, any contiguous run of unescaped whitespace
+    acts as a separator between words.
+
+  * Inside double quotes, no word splitting occurs; backslash may
+    be used to escape a backslash or double quote, but will be passed
+    through as a normal character before anything else.
+
+  * Inside single quotes, no word splitting occurs and no escape
+    sequences are recognized; it is not possible to write a single
+    quote within single quotes.
+
+* If a string is passed and the ``local_quotes=True`` option is given,
+  it will be assumed to follow Windows quoting rules (no special
+  meaning for single quotes, no special meaning for backslashes except
+  immediately before a double quote) when running on Windows platforms,
+  and POSIX rules when running on UNIX platforms.
+
+Trio performs this normalization because the underlying system
+subprocess-spawning functions vary in what sort of input they
+want: a sequence on UNIX platforms with ``shell=False``, a POSIX-quoted
+string on UNIX platforms with ``shell=True``, a Windows-quoted
+string on Windows platforms with ``shell=False``, and two levels
+of Windows-quoted string on Windows platforms with ``shell=True``.
+The Python standard library doesn't provide any facility for turning
+a sequence of arguments into a Windows-quoted string, so it's easier
+to standardize on POSIX quotes.
+
+.. list-table:: Summary of quoting behavior
+   :widths: auto
+   :header-rows: 1
+
+   * - Platform
+     - ``shell`` option
+     - Sequence behavior
+     - String behavior
+     - ... with ``local_quotes=True``
+   * - UNIX
+     - False
+     - Use as-is
+     - :func:`shlex.split`
+     - :func:`shlex.split`
+   * - UNIX
+     - True
+     - :func:`shlex.quote`
+     - Use as-is
+     - Use as-is
+   * - Windows
+     - False
+     - Quote using Windows rules
+     - :func:`shlex.split` then quote using Windows rules
+     - Use as-is
+   * - Windows
+     - True
+     - Quote twice using Windows rules
+     - :func:`shlex.split` then quote twice using Windows rules
+     - Quote once using Windows rules
 
 
 .. _subprocess-options:
@@ -680,9 +770,21 @@ so these options don't make sense. Text I/O should use a layer
 on top of the raw byte streams, just as it does with sockets.
 [This layer does not yet exist, but is in the works.]
 
+The Trio-specific boolean option ``local_quotes``, described
+:ref:`above <subprocess-quoting>`, is also supported in all
+``**options`` lists.
+
 
 Running a process and waiting for it to finish
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+-The basic interface for running a subprocess start-to-finish is
+-:func:`trio.subprocess.run`.  It always waits for the subprocess to
+-exit before returning, so there's no need to worry about leaving
+-a process running by mistake after you've gone on to do other things.
+-:func:`~trio.subprocess.run` can supply input or read output from
+-the subprocess, and can optionally throw an exception if the subprocess
+-exits with a failure indication.
 
 We're `working on <https://github.com/python-trio/trio/pull/791>`
 figuring out the best API for common higher-level subprocess operations.
