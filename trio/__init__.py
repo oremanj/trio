@@ -60,7 +60,10 @@ from ._highlevel_ssl_helpers import (
     open_ssl_over_tcp_stream, open_ssl_over_tcp_listeners, serve_ssl_over_tcp
 )
 
-from ._subprocess import Process, run_process
+from ._subprocess import (
+    Process, ProcessStream,
+    run_process, delegate_to_process, interact_with_process
+)
 
 from ._deprecate import TrioDeprecationWarning
 
@@ -68,6 +71,7 @@ from ._deprecate import TrioDeprecationWarning
 from . import hazmat
 from . import socket
 from . import abc
+from . import subprocess
 from . import ssl
 # Not imported by default: testing
 if False:
