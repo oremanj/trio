@@ -1,6 +1,7 @@
 import math
 import os
 import select
+import signal
 import subprocess
 import sys
 import attr
@@ -197,7 +198,7 @@ class Process(AsyncResource):
                 status = "exited with status {}".format(self.returncode)
             if self.returncode != 0 and not self.failed:
                 status += " (our fault)"
-        return "<trio.Process {!r}: {}>".format(self.args, self.status)
+        return "<trio.Process {!r}: {}>".format(self.args, status)
 
     @property
     def returncode(self):
@@ -245,6 +246,10 @@ class Process(AsyncResource):
           to that signal, we don't consider that a failure. (This covers
           signals like ``SIGHUP``, ``SIGINT``, etc, which are exit
           signals for some processes and not for others.)
+
+        The higher-level subprocess API functions such as :func:`run_process`
+        use :attr:`failed` to determine whether they should throw a
+        :exc:`subprocess.CalledProcessError` or not.
 
         """
         if self.returncode is None:
@@ -448,7 +453,7 @@ async def run_process(
           be unspecified or None.
       check (bool): If false, don't validate that the subprocess exits
           successfully. You should be sure to check the
-          :attr:`Process.returncode` or :attr:`Process.failed`
+          :attr:`~Process.returncode` or :attr:`~Process.failed`
           attribute of the returned object if you pass
           ``check=False``, so that errors don't pass silently.
       timeout (float): If specified, do not allow the process to run for
@@ -486,7 +491,7 @@ async def run_process(
       subprocess.TimeoutExpired: if the process is killed due to the
           expiry of the given ``deadline`` or ``timeout``
       subprocess.CalledProcessError: if ``check=False`` is not passed
-          and the process exits with an exit status that we deem to constitute
+          and the process exits with an exit status that we deem to indicate
           failure; see :attr:`Process.failed`
       OSError: if an error is encountered starting or communicating with
           the process
@@ -497,6 +502,9 @@ async def run_process(
         manage_stdin = False
         if input is not None:
             raise ValueError('stdin and input arguments may not both be used')
+    elif input is None:
+        manage_stdin = False
+        options['stdin'] = subprocess.DEVNULL
     else:
         manage_stdin = True
         options['stdin'] = subprocess.PIPE
@@ -527,11 +535,10 @@ async def run_process(
 
     async def feed_input(stream):
         async with stream:
-            if input:
-                try:
-                    await stream.send_all(input)
-                except (_core.BrokenResourceError, _core.ClosedResourceError):
-                    pass
+            try:
+                await stream.send_all(input)
+            except (_core.BrokenResourceError, _core.ClosedResourceError):
+                pass
 
     async def read_output(stream, chunks):
         async with stream:
