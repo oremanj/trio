@@ -318,16 +318,19 @@ class CancelScope:
             ever_had_branches = self._branches != ()
             new = inf
             if not self.cancel_called:
-                # Before the first cancel(), our deadline is always relevant
-                # -- we 
-                # if we have any tasks to deliver the cancellation to or
-                # if 
+                # Before the first cancel(), our deadline is relevant
+                # if we have any tasks or any linked children.
                 if self._tasks or ever_had_branches:
                     new = self._deadline
-
             elif not self.cleanup_expired:
+                # During the cleanup period, our deadline is relevant if
+                # we have any tasks -- linked children don't matter, since
+                # the expiry of the grace period doesn't get propagated
+                # to children.
                 if self._tasks:
-                    new = self._cleanup_started_at + self.effective_grace_period
+                    new = (
+                        self._cleanup_started_at + self.effective_grace_period
+                    )
 
             if old != new:
                 self._effective_deadline = new
@@ -416,17 +419,20 @@ class CancelScope:
             if self.cancel_called and not self.cleanup_expired:
                 stack.enter_context(self._might_change_effective_deadline())
 
-            nested_within_self = False
-            for scope in self._scope_task._cancel_stack:
-                if nested_within_self:
+            my_index = self._scope_task._cancel_stack.index(self)
+            affected_scopes = set()
+            for task in self._tasks:
+                assert task._cancel_stack[my_index] is self
+                for scope in task._cancel_stack[my_index + 1 :]:
+                    if scope in affected_scopes:
+                        continue
                     if scope.grace_period is not None:
                         break
                     if scope.cancel_called and not scope.cleanup_expired:
                         stack.enter_context(
                             scope._might_change_effective_deadline()
                         )
-                if scope is self:
-                    nested_within_self = True
+                        affected_scopes.add(scope)
 
             self._grace_period = new_grace_period
 
@@ -813,13 +819,13 @@ def _pending_cancel_scope(cancel_stack):
     for scope in cancel_stack:
         # Check shielding before cancellation state, because shield
         # should not block processing of *this* scope's exception
-        if scope.shield:
+        if scope._shield:
             # Full shield: nothing outside this scope can affect a task
             # that is currently executing code inside the scope.
             pending_scope = None
             pending_with_cleanup_expired = None
 
-        if scope.shield_during_cleanup:
+        if scope._shield_during_cleanup:
             # Shield during cleanup: only cancel scopes with cleanup_expired
             # outside this scope can affect a task that's executing code
             # inside it.
@@ -830,8 +836,6 @@ def _pending_cancel_scope(cancel_stack):
 
         if pending_with_cleanup_expired is None and scope.cleanup_expired:
             pending_with_cleanup_expired = scope
-            if pending_scope is None:
-                pending_scope = scope
 
     return pending_scope
 
@@ -1853,12 +1857,26 @@ def current_effective_deadline():
     """
     task = current_task()
     deadline = inf
+    deadline_from_cleanup_expired = inf
+
     for scope in task._cancel_stack:
         if scope._shield:
-            deadline = inf
+            deadline = deadline_from_cleanup_expired = inf
+        if scope._shield_during_cleanup:
+            deadline = deadline_from_cleanup_expired
+
         if scope.cancel_called:
             deadline = -inf
-        deadline = min(deadline, scope._deadline)
+            if scope.cleanup_expired:
+                deadline_from_cleanup_expired = -inf
+            else:
+                deadline_from_cleanup_expired = min(
+                    deadline_from_cleanup_expired,
+                    scope._cleanup_started_at + scope.effective_grace_period
+                )
+        else:
+            deadline = min(deadline, scope._deadline)
+
     return deadline
 
 
