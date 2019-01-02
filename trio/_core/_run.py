@@ -179,12 +179,13 @@ class CancelScope:
     _tasks = attr.ib(factory=set, init=False)
     _scope_task = attr.ib(default=None, init=False)
     _effective_deadline = attr.ib(default=inf, init=False)
+    _cleanup_started_at = attr.ib(default=inf, init=False)
     cancel_called = attr.ib(default=False, init=False)
     cleanup_expired = attr.ib(default=False, init=False)
     cancelled_caught = attr.ib(default=False, init=False)
 
     # Most cancel scopes don't have branches; those that do will replace
-    # this empty tuple with an instance-level WeakSet
+    # this empty tuple with a WeakSet
     _branches = attr.ib(default=(), init=False)
 
     # Constructor arguments:
@@ -315,12 +316,19 @@ class CancelScope:
         finally:
             old = self._effective_deadline
             ever_had_branches = self._branches != ()
-            if self.cleanup_expired or (
-                not self._tasks and not ever_had_branches
-            ):
-                new = inf
-            else:
-                new = self._deadline
+            new = inf
+            if not self.cancel_called:
+                # Before the first cancel(), our deadline is always relevant
+                # -- we 
+                # if we have any tasks to deliver the cancellation to or
+                # if 
+                if self._tasks or ever_had_branches:
+                    new = self._deadline
+
+            elif not self.cleanup_expired:
+                if self._tasks:
+                    new = self._cleanup_started_at + self.effective_grace_period
+
             if old != new:
                 self._effective_deadline = new
                 runner = GLOBAL_RUN_CONTEXT.runner
@@ -397,41 +405,29 @@ class CancelScope:
             branch.grace_period = new_grace_period
 
         if self._scope_task is None:
-            self._grace_period = value
+            self._grace_period = new_grace_period
             return
 
         # Changing the grace period affects deadlines for all scopes
         # that are in their cleanup window, nested within this scope,
         # and not nested within a deeper scope whose grace period isn't
         # changing.
-        impacted_scopes = []
-        if self.cancel_called and not self.cleanup_expired:
-            impacted_scopes.append(self)
+        with ExitStack() as stack:
+            if self.cancel_called and not self.cleanup_expired:
+                stack.enter_context(self._might_change_effective_deadline())
 
-        nested_within_self = False
-        for scope in self._scope_task._cancel_stack:
-            if nested_within_self:
-                if scope.grace_period is not None:
-                    break
-                if scope.cancel_called and not scope.cleanup_expired:
-                    impacted_scopes.append(scope)
-            if scope is self:
-                nested_within_self = True
+            nested_within_self = False
+            for scope in self._scope_task._cancel_stack:
+                if nested_within_self:
+                    if scope.grace_period is not None:
+                        break
+                    if scope.cancel_called and not scope.cleanup_expired:
+                        stack.enter_context(
+                            scope._might_change_effective_deadline()
+                        )
+                if scope is self:
+                    nested_within_self = True
 
-        if impacted_scopes:
-            old_effective_grace_period = self.effective_grace_period
-            assert all(
-                scope.effective_grace_period == old_effective_grace_period
-                for scope in impacted_scopes
-            )
-            self._grace_period = new_grace_period
-            grace_period_delta = (
-                self.effective_grace_period - old_effective_grace_period
-            )
-            for scope in impacted_scopes:
-                with scope._might_change_effective_deadline():
-                    scope._deadline += grace_period_delta
-        else:
             self._grace_period = new_grace_period
 
     @property
@@ -439,7 +435,7 @@ class CancelScope:
         if self._grace_period is not None:
             return self._grace_period
         if self._scope_task is None:
-            return 0
+            return None
 
         effective_grace_period = 0
         for scope in self._scope_task._cancel_stack:
@@ -452,24 +448,36 @@ class CancelScope:
     def _cancel_no_notify(self):
         # returns the affected tasks
         if not self.cancel_called:
+            # Initial cancel() applies to us and all branches.
             with self._might_change_effective_deadline():
                 self.cancel_called = True
-                grace_period = self.effective_grace_period
-                if grace_period == 0:
+                if self.effective_grace_period == 0:
+                    # If we have no grace period, switch immediately
+                    # to hard-cancel mode.
                     self.cleanup_expired = True
                 else:
-                    self._deadline = _core.current_time() + grace_period
+                    self._cleanup_started_at = _core.current_time()
+
+            affected_tasks = self._tasks
+            if self._branches:
+                affected_tasks = set(affected_tasks)
+                for branch in self._branches:
+                    affected_tasks.update(branch._cancel_no_notify())
+
         elif not self.cleanup_expired:
+            # Second cancel() represents expiration of the grace period
+            # for cleanup. It applies only to this cancel scope; our
+            # branches might have their own grace periods, and our
+            # initial cancel() started those clocks running.
             with self._might_change_effective_deadline():
                 self.cleanup_expired = True
+            affected_tasks = self._tasks
+
         else:
+            # An additional cancel after we're already hard-cancelled
+            # doesn't do anything further.
             return set()
 
-        affected_tasks = self._tasks
-        if self._branches:
-            affected_tasks = set(affected_tasks)
-            for branch in self._branches:
-                affected_tasks.update(branch._cancel_no_notify())
         return affected_tasks
 
     @enable_ki_protection
