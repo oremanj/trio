@@ -260,6 +260,7 @@ class CancelScope:
             shield_during_cleanup = self._shield_during_cleanup
         if grace_period is None:
             grace_period = self._grace_period
+
         child = CancelScope(
             deadline=deadline,
             shield=shield,
@@ -268,6 +269,7 @@ class CancelScope:
         )
         if self.cancel_called:
             # notify not needed because the child has no tasks at this point
+            child._local_grace_period = self._local_grace_period
             child._cancel_no_notify(self._cleanup_started_at)
         self._linked_children.add(child)
         return child
@@ -356,48 +358,40 @@ class CancelScope:
         with self._might_change_effective_deadline():
             self._deadline = float(new_deadline)
 
-    def _notify_shielding_reduced(self):
-        for task in self._tasks:
-            task._attempt_delivery_of_any_pending_cancel()
-        for child in self.linked_children:
-            for task in child._tasks:
-                task._attempt_delivery_of_any_pending_cancel()
-
     @property
     def shield(self):
         return self._shield
 
     @shield.setter
-    @enable_ki_protection
     def shield(self, new_value):
-        if not isinstance(new_value, bool):
-            raise TypeError("shield must be a bool")
-
-        # Set shielding for us and all linked children, then check
-        # cancellations for us and all linked children if shielding
-        # was turned off. This ordering ensures that each task
-        # receives the cancellation for its outermost cancelled scope.
-        self._shield = new_value
-        for child in self.linked_children:
-            child._shield = new_value
-        if not self._shield:
-            self._notify_shielding_reduced()
+        self._set_shield("_shield", new_value)
 
     @property
     def shield_during_cleanup(self):
         return self._shield_during_cleanup
 
-    @shield.setter
-    @enable_ki_protection
+    @shield_during_cleanup.setter
     def shield_during_cleanup(self, new_value):
-        if not isinstance(new_value, bool):
-            raise TypeError("shield_during_cleanup must be a bool")
+        self._set_shield("_shield_during_cleanup", new_value)
 
-        self._shield_during_cleanup = new_value
+    @enable_ki_protection
+    def _set_shield(self, attr, new_value):
+        if not isinstance(new_value, bool):
+            raise TypeError("{} must be a bool".format(attr.lstrip("_")))
+
+        # Set shielding for us and all linked children, then check
+        # cancellations for us and all linked children if shielding
+        # was turned off. This ordering ensures that each task
+        # receives the cancellation for its outermost cancelled scope.
+        setattr(self, attr, new_value)
         for child in self.linked_children:
-            child._shield_during_cleanup = new_value
-        if not self._shield_during_cleanup:
-            self._notify_shielding_reduced()
+            setattr(child, attr, new_value)
+        if not new_value:
+            for task in self._tasks:
+                task._attempt_delivery_of_any_pending_cancel()
+            for child in self.linked_children:
+                for task in child._tasks:
+                    task._attempt_delivery_of_any_pending_cancel()
 
     @property
     def grace_period(self):
@@ -414,8 +408,11 @@ class CancelScope:
         for child in self._linked_children:
             child.grace_period = new_grace_period
 
+        self._grace_period = new_grace_period
+        self._grace_period_updated()
+
+    def _grace_period_updated(self):
         if self._scope_task is None:
-            self._grace_period = new_grace_period
             return
 
         # Changing the grace period affects deadlines for all scopes
@@ -441,7 +438,9 @@ class CancelScope:
                         )
                         affected_scopes.add(scope)
 
-            self._grace_period = new_grace_period
+    @grace_period.deleter
+    def grace_period(self):
+        self.grace_period = None
 
     @property
     def effective_grace_period(self):
@@ -456,6 +455,8 @@ class CancelScope:
                 effective_grace_period = scope._grace_period
             if scope is self:
                 break
+        else:  # pragma: no cover
+            raise AssertionError("cancel stack corrupted")
         return effective_grace_period
 
     @property
@@ -493,9 +494,14 @@ class CancelScope:
                 self.cleanup_expired = True
             affected_tasks = self._tasks
 
-        else:
+        else:  # pragma: no cover
             # An additional cancellation after we're already
             # hard-cancelled doesn't do anything further.
+            # (We shouldn't actually be able to get here, because
+            # the user-facing interfaces check cancel_called before
+            # entering _cancel_no_notify, and the deadline manager
+            # won't call us because we won't register a deadline
+            # after cleanup_expired.)
             return set()
 
         return affected_tasks
@@ -673,19 +679,7 @@ class _TaskStatus:
             new_stack[-1].effective_grace_period
             != old_stack[-1].effective_grace_period
         ):
-            with ExitStack() as stack:
-                munged_scopes = set()
-                for task in munged_tasks:
-                    for scope in task._cancel_stack[len(new_stack):]:
-                        if scope.grace_period is not None:
-                            break
-                        if scope.cleanup_expired or not scope.cancel_called:
-                            continue
-                        if scope not in munged_scopes:
-                            munged_scopes.add(scope)
-                            stack.enter_context(
-                                scope._might_change_effective_deadline()
-                            )
+            new_stack[-1]._grace_period_updated()
 
         # After all the delicate surgery is done, check for cancellation in
         # all the tasks that had their cancel scopes munged. This can trigger
@@ -787,7 +781,16 @@ class Nursery:
 
     def _add_exc(self, exc):
         self._pending_excs.append(exc)
-        self.cancel_scope.cancel()
+        if isinstance(exc, _core.Cancelled):
+            # A cancellation that propagates out of a task must be
+            # associated with some cancel scope in the nursery's cancel
+            # stack. If that scope is cancelled, it's cancelled for all
+            # tasks in the nursery, and adding our own cancellation on
+            # top of that (with a potentially different grace period)
+            # just confuses things.
+            pass
+        else:
+            self.cancel_scope.cancel()
 
     def _check_nursery_closed(self):
         if not any(
@@ -1371,9 +1374,9 @@ class Runner:
 
     async def init(self, async_fn, args, grace_period):
         async with open_nursery() as system_nursery:
-            system_nursery.cancel_scope.grace_period = grace_period
             self.system_nursery = system_nursery
             try:
+                system_nursery.cancel_scope.grace_period = grace_period
                 self.main_task = self.spawn_impl(
                     async_fn, args, system_nursery, None
                 )
@@ -1635,7 +1638,7 @@ def run(
           <cleanup-with-grace-period>`, in seconds, to use for
           cancellations where no enclosing scope specifies one.
           Default is zero (no grace period). Effectively this behaves
-          as if the body of :func:`async_fn`, and every system task,
+          as if the body of ``async_fn``, and every system task,
           were enclosed in a ``with
           trio.CancelScope(grace_period=...):`` block.
 
@@ -1936,26 +1939,30 @@ def current_effective_deadline():
     """
     task = current_task()
     deadline = inf
-    deadline_from_cleanup_expired = inf
+    cleanup_expiry = inf
 
     for scope in task._cancel_stack:
         if scope._shield:
-            deadline = deadline_from_cleanup_expired = inf
+            deadline = cleanup_expiry = inf
         if scope._shield_during_cleanup:
-            deadline = deadline_from_cleanup_expired
+            deadline = cleanup_expiry
 
         if scope.cancel_called:
             deadline = -inf
             if scope.cleanup_expired:
-                deadline_from_cleanup_expired = -inf
+                cleanup_expiry = -inf
             else:
-                deadline_from_cleanup_expired = min(
-                    deadline_from_cleanup_expired,
+                cleanup_expiry = min(
+                    cleanup_expiry,
                     scope._cleanup_started_at
                     + scope._local_effective_grace_period
                 )
         else:
             deadline = min(deadline, scope._deadline)
+            cleanup_expiry = min(
+                cleanup_expiry,
+                scope._deadline + scope._local_effective_grace_period
+            )
 
     return deadline
 

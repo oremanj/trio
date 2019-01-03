@@ -156,18 +156,21 @@ def shield_during_cleanup():
     run for a bit longer after a cancel scope that surrounds it becomes
     cancelled.
 
-    The exact amount of additional time is specified by the ``grace_period``
-    argument to the :meth:`~trio.CancelScope.cancel` call that caused the
-    cancellation, or by the :attr:`~trio.CancelScope.grace_period` attribute
-    of the cancel scope. This is intended for use with cleanup code that
-    might run while a :exc:`~trio.Cancelled` exception is propagating
-    (e.g. in ``finally`` blocks or ``__aexit__`` handlers) for which an
-    orderly shutdown requires blocking.
+    The exact amount of additional time is specified by the
+    ``grace_period`` argument to the :meth:`~trio.CancelScope.cancel`
+    call that caused the cancellation, or by the
+    :attr:`~trio.CancelScope.grace_period` attribute of the cancel
+    scope that became cancelled (which might have been inherited from
+    an enclosing scope). This is intended for use with cleanup code
+    that might run while a :exc:`~trio.Cancelled` exception is
+    propagating (e.g., in ``finally`` blocks or ``__aexit__`` handlers)
+    for which an orderly shutdown requires blocking.
 
     The default grace period is *zero*, and code that uses
     :func:`shield_during_cleanup` must still be prepared for
     a possible cancellation.  Use a cancel scope with the
     :attr:`~trio.CancelScope.shield` attribute set to :data:`True` if
     you really need to definitely not be interrupted.
+
     """
     return trio.CancelScope(shield_during_cleanup=True)

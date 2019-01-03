@@ -338,7 +338,7 @@ Cancellation semantics
 ~~~~~~~~~~~~~~~~~~~~~~
 
 Nesting of cancel scopes
-^^^^^^^^^^^^^^^^^^^^^^^^
+++++++++++++++++++++++++
 
 You can freely nest cancellation blocks, and each :exc:`Cancelled`
 exception "knows" which block it belongs to. So long as you don't stop
@@ -370,7 +370,7 @@ The end result is that trio has successfully cancelled exactly the
 work that was happening within the scope that was cancelled.
 
 Checking whether a scope was cancelled
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+++++++++++++++++++++++++++++++++++++++
 
 Looking at this, you might wonder how you can tell whether the inner
 block timed out – perhaps you want to do something different, like try
@@ -391,7 +391,7 @@ so forth – see :class:`CancelScope` below for the full details.
 .. _blocking-cleanup-example:
 
 Cancellations affect blocking cleanup too
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
++++++++++++++++++++++++++++++++++++++++++
 
 Cancellations in trio are "level triggered", meaning that once a block
 has been cancelled, *all* cancellable operations in that block will
@@ -423,16 +423,22 @@ it will also raise :exc:`Cancelled`.
 .. _cleanup-with-grace-period:
 
 Grace periods allow blocking cleanup within externally-specified limits
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 Of course, if you really want to make another blocking call in your
 cleanup handler, trio will let you, and it even lets you provide a
 top-down limit on the amount of time that the blocking cleanup should
-be allowed to take. To do this, you need to mark the part of your code
-that wants to do blocking cleanup after a cancellation, and also
-specify a *grace period*, at some level at or above the original
-cancelled scope, to indicate how long that blocking cleanup should be
-allowed to go on for::
+be allowed to take. To take advantage of this, you need to do two things:
+
+* surround the part of your code that wants to do blocking cleanup
+  after a cancellation in a ``with trio.shield_during_cleanup():``
+  block
+
+* specify a *grace period*, at some level at or above the original
+  cancelled scope, to indicate how long that blocking cleanup should be
+  allowed to go on for
+
+For example::
 
    with trio.move_on_after(TIMEOUT, grace_period=CLEANUP_TIMEOUT):
        conn = await make_connection()
@@ -516,7 +522,7 @@ keep in mind:
   just like the rest of the scope.
 
 Shielding allows unlimited blocking cleanup
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
++++++++++++++++++++++++++++++++++++++++++++
 
 Finally, if you really need to locally force some code to run beyond
 the point at which an enclosing scope said it should be cancelled,
@@ -537,7 +543,8 @@ be written::
 But the grace period approach works better as your application becomes
 more complex, because it lets you specify limits on cleanup duration
 as a matter of policy rather than at each place that does any cleanup.
-Shielding should only be used where it's required for correct behavior.
+Shielding should only be used where you can't obtain correct behavior
+in any other way. (For an example, see :meth:`~trio.Condition.wait`.)
 
 So long as you're inside a scope with ``shield = True`` set,
 you'll be protected from outside cancellations. Note though that this
@@ -667,16 +674,17 @@ objects.
       duration is specified externally.
 
       You can set both :attr:`shield` and
-      :attr:`shield_during_cleanup` independently, but :attr:`shield`
-      offers strictly more protection, so if :attr:`shield` is :data:`True`
-      then the value of :attr:`shield_during_cleanup` doesn't matter.
+      :attr:`~CancelScope.shield_during_cleanup` independently, but
+      :attr:`shield` offers strictly more protection, so if
+      :attr:`shield` is :data:`True` then the value of
+      :attr:`~CancelScope.shield_during_cleanup` doesn't matter.
 
    .. attribute:: grace_period
 
       Read-write, :class:`float`, default :data:`None`. Specifies the
       duration (in seconds) after this scope becomes cancelled during
       which cancel scopes nested inside this one should be shielded
-      from cancellation if their :attr:`shield_during_cleanup`
+      from cancellation if their :attr:`~CancelScope.shield_during_cleanup`
       attribute is :data:`True`.
 
       The default of :data:`None` means to inherit the
@@ -689,9 +697,9 @@ objects.
 
       Changing the :attr:`grace_period` after a cancellation has
       occurred (that did not specify its own grace period) will affect
-      the time at which :attr:`shield_during_cleanup` scopes become
-      cancelled, but will not make them un-cancelled if they've
-      already become cancelled.
+      the future time at which the cancellation proceeds into
+      :func:`shield_during_cleanup` scopes, but will not re-protect
+      them if the previous grace period already expired.
 
    .. attribute:: effective_grace_period
 
@@ -718,10 +726,10 @@ objects.
         or the current :attr:`effective_grace_period` if not.
 
       * Work within this scope that is not within a nested
-        :attr:`shield_during_cleanup` scope is cancelled immediately.
+        :func:`shield_during_cleanup` scope is cancelled immediately.
 
       * Work within this scope that is within a nested
-        :attr:`shield_during_cleanup` scope is cancelled
+        :func:`shield_during_cleanup` scope is cancelled
         after the expiry of the grace period for this cancellation,
         or immediately if the grace period is zero.
 
@@ -807,7 +815,7 @@ objects.
       child's deadline cancels that child only.
 
       The new linked child inherits its non-:attr:`deadline` mutable
-      attributes (:attr:`shield`, :attr:`shield_during_cleanup`,
+      attributes (:attr:`shield`, :attr:`~CancelScope.shield_during_cleanup`,
       :attr:`grace_period`) from the parent, unless overridden by a
       corresponding argument to :meth:`linked_child`.  The child's
       version of these attributes may be changed without affecting the
@@ -815,20 +823,22 @@ objects.
       to all children, overriding any local value they've previously
       set.
 
-      Calling ``cancel(grace_period=...)`` on the parent uses the
-      given grace period for cancellations of each not-yet-cancelled
-      linked child too. Calling :meth:`cancel` with no
-      ``grace_period`` argument causes each not-yet-cancelled linked
-      child to be cancelled using its own
-      :attr:`effective_grace_period`.  Calling
-      :meth:`cancel_immediately` on the parent has the effect of
-      calling it on all linked children too.
+      If a linked child is created from a scope that is already
+      cancelled, the child is considered to have been cancelled at the
+      same time as its parent was. If the child's effective grace
+      period is different from the parent's, this may result in a
+      different time at which the grace period is considered to
+      expire.  A per-cancellation grace period specified with
+      ``cancel(grace_period=...)`` is propagated to linked children as
+      well, including those that don't yet exist at the time of the
+      call to :meth:`cancel`.
 
       Cancel scope operations are atomic even when linked children
       are involved. For example, if multiple scopes are to become
       cancelled due to a single call to :meth:`cancel`, they all
       become cancelled before any of the tasks inside them are
-      notified of the cancellation.
+      notified of the cancellation; there is no point where
+      user code can see some of the scopes cancelled but not others.
 
       Multiple layers of cancel scope linkage are supported.  The
       cancellation of any parent scope affects all its linked
