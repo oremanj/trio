@@ -337,8 +337,8 @@ class CancelScope:
                 # to children.
                 if self._tasks:
                     new = (
-                        self._cleanup_started_at
-                        + self._local_effective_grace_period
+                        self._cleanup_started_at +
+                        self._local_effective_grace_period
                     )
 
             if old != new:
@@ -427,7 +427,7 @@ class CancelScope:
             affected_scopes = set()
             for task in self._tasks:
                 assert task._cancel_stack[my_index] is self
-                for scope in task._cancel_stack[my_index + 1 :]:
+                for scope in task._cancel_stack[my_index + 1:]:
                     if scope in affected_scopes:
                         continue
                     if scope.grace_period is not None:
@@ -676,8 +676,8 @@ class _TaskStatus:
         # grace periods -- poke them to update. This can change deadlines but
         # doesn't deliver any cancellations.
         if (
-            new_stack[-1].effective_grace_period
-            != old_stack[-1].effective_grace_period
+            new_stack[-1].effective_grace_period !=
+            old_stack[-1].effective_grace_period
         ):
             new_stack[-1]._grace_period_updated()
 
@@ -1953,9 +1953,8 @@ def current_effective_deadline():
                 cleanup_expiry = -inf
             else:
                 cleanup_expiry = min(
-                    cleanup_expiry,
-                    scope._cleanup_started_at
-                    + scope._local_effective_grace_period
+                    cleanup_expiry, scope._cleanup_started_at +
+                    scope._local_effective_grace_period
                 )
         else:
             deadline = min(deadline, scope._deadline)

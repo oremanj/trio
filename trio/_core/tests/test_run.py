@@ -1046,7 +1046,9 @@ async def test_cancel_graceful(autojump_clock):
     # was cancelled first
     start = _core.current_time()
     with _core.CancelScope(deadline=start + 1, grace_period=1) as outer:
-        with _core.CancelScope(deadline=start + 1.5, grace_period=0.3) as inner:
+        with _core.CancelScope(
+            deadline=start + 1.5, grace_period=0.3
+        ) as inner:
             try:
                 await sleep(10)
             finally:
@@ -1293,7 +1295,6 @@ async def test_cancel_graceful(autojump_clock):
 
 
 def test_grace_period_inheritance():
-
     async def check_in_system_task(default_grace):
         with _core.CancelScope() as scope:
             assert scope.effective_grace_period == default_grace
