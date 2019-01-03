@@ -8,7 +8,7 @@ import threading
 import weakref
 from collections import deque
 import collections.abc
-from contextlib import contextmanager, closing
+from contextlib import contextmanager, closing, ExitStack
 
 from contextvars import copy_context
 from math import inf
@@ -21,7 +21,7 @@ from async_generator import isasyncgen
 from sortedcontainers import SortedDict
 from outcome import Error, Value, capture
 
-from . import _public
+from . import _public, _local
 from ._entry_queue import EntryQueue, TrioToken
 from ._exceptions import (TrioInternalError, RunFinishedError, Cancelled)
 from ._ki import (
@@ -170,9 +170,11 @@ class CancelScope:
     deadline, see the :meth:`open_branch` method.
 
     The :class:`CancelScope` constructor takes initial values for the
-    cancel scope's :attr:`deadline` and :attr:`shield` attributes; these
-    may be freely modified after construction, whether or not the scope
-    has been entered yet, and changes take immediate effect.
+    cancel scope's :attr:`deadline`, :attr:`shield`,
+    :attr:`shield_during_cleanup`, and :attr:`grace_period`
+    attributes; these may be freely modified after construction,
+    whether or not the scope has been entered yet, and changes take
+    immediate effect.
 
     """
 
@@ -180,6 +182,7 @@ class CancelScope:
     _scope_task = attr.ib(default=None, init=False)
     _effective_deadline = attr.ib(default=inf, init=False)
     _cleanup_started_at = attr.ib(default=inf, init=False)
+    _local_grace_period = attr.ib(default=None, init=False)
     cancel_called = attr.ib(default=False, init=False)
     cleanup_expired = attr.ib(default=False, init=False)
     cancelled_caught = attr.ib(default=False, init=False)
@@ -263,9 +266,8 @@ class CancelScope:
             grace_period=grace_period,
         )
         if self.cancel_called:
-            child.cancel()
-        if self.cleanup_expired:
-            child.cancel()
+            # notify not needed because the child has no tasks at this point
+            child._cancel_no_notify(self._cleanup_started_at)
         self._branches.add(child)
         return child
 
@@ -318,7 +320,7 @@ class CancelScope:
             ever_had_branches = self._branches != ()
             new = inf
             if not self.cancel_called:
-                # Before the first cancel(), our deadline is relevant
+                # Before a cancellation, our deadline is relevant
                 # if we have any tasks or any linked children.
                 if self._tasks or ever_had_branches:
                     new = self._deadline
@@ -329,7 +331,8 @@ class CancelScope:
                 # to children.
                 if self._tasks:
                     new = (
-                        self._cleanup_started_at + self.effective_grace_period
+                        self._cleanup_started_at
+                        + self._local_effective_grace_period
                     )
 
             if old != new:
@@ -349,7 +352,7 @@ class CancelScope:
         with self._might_change_effective_deadline():
             self._deadline = float(new_deadline)
 
-    def _notify_shielding_reduced():
+    def _notify_shielding_reduced(self):
         for task in self._tasks:
             task._attempt_delivery_of_any_pending_cancel()
         for branch in self.branches:
@@ -451,53 +454,91 @@ class CancelScope:
                 break
         return effective_grace_period
 
-    def _cancel_no_notify(self):
+    @property
+    def _local_effective_grace_period(self):
+        if self._local_grace_period is not None:
+            return self._local_grace_period
+        return self.effective_grace_period
+
+    def _cancel_no_notify(self, as_of):
         # returns the affected tasks
         if not self.cancel_called:
-            # Initial cancel() applies to us and all branches.
+            # Initial cancellation applies to us and all branches.
             with self._might_change_effective_deadline():
                 self.cancel_called = True
-                if self.effective_grace_period == 0:
+                self._cleanup_started_at = as_of
+                if self._local_effective_grace_period == 0:
                     # If we have no grace period, switch immediately
                     # to hard-cancel mode.
                     self.cleanup_expired = True
-                else:
-                    self._cleanup_started_at = _core.current_time()
 
             affected_tasks = self._tasks
             if self._branches:
                 affected_tasks = set(affected_tasks)
                 for branch in self._branches:
-                    affected_tasks.update(branch._cancel_no_notify())
+                    if not branch.cancel_called:
+                        affected_tasks.update(branch._cancel_no_notify(as_of))
 
         elif not self.cleanup_expired:
-            # Second cancel() represents expiration of the grace period
-            # for cleanup. It applies only to this cancel scope; our
-            # branches might have their own grace periods, and our
-            # initial cancel() started those clocks running.
+            # Second cancellation represents expiration of the grace
+            # period for cleanup. It applies only to this cancel
+            # scope; our branches might have their own grace periods,
+            # and our initial cancellation started those clocks
+            # running.
             with self._might_change_effective_deadline():
                 self.cleanup_expired = True
             affected_tasks = self._tasks
 
         else:
-            # An additional cancel after we're already hard-cancelled
-            # doesn't do anything further.
+            # An additional cancellation after we're already
+            # hard-cancelled doesn't do anything further.
             return set()
 
         return affected_tasks
 
     @enable_ki_protection
-    def cancel(self):
-        for task in self._cancel_no_notify():
+    def cancel(self, *, grace_period=None):
+        # Users call cancel(), while the deadline machinery calls
+        # _cancel_no_notify(). We want the user-facing cancel()
+        # interface to be idempotent, even though _cancel_no_notify()
+        # is stateful (not cancelled -> cancelled pending cleanup ->
+        # fully cancelled).
+        if self.cancel_called:
+            return
+
+        if grace_period is not None:
+            self._local_grace_period = grace_period
+            for branch in self.branches:
+                if not branch.cancel_called:
+                    branch._local_grace_period = grace_period
+
+        for task in self._cancel_no_notify(_core.current_time()):
             task._attempt_delivery_of_any_pending_cancel()
 
-    def start_cleanup(self):
-        if not self.cancel_called:
-            self.cancel()
+    def _cancel_immediately_no_notify(self, as_of):
+        if self.cleanup_expired:
+            return set()
 
+        with self._might_change_effective_deadline():
+            if not self.cancel_called:
+                self.cancel_called = True
+                self._cleanup_started_at = as_of
+            self.cleanup_expired = True
+            self._local_grace_period = 0
+
+        affected_tasks = self._tasks
+        if self._branches:
+            affected_tasks = set(affected_tasks)
+            for branch in self._branches:
+                affected_tasks.update(
+                    branch._cancel_immediately_no_notify(as_of)
+                )
+        return affected_tasks
+
+    @enable_ki_protection
     def cancel_immediately(self):
-        while not self.cleanup_expired:
-            self.cancel()
+        for task in self._cancel_immediately_no_notify(_core.current_time()):
+            task._attempt_delivery_of_any_pending_cancel()
 
     def _add_task(self, task):
         self._tasks.add(task)
@@ -510,8 +551,7 @@ class CancelScope:
 
     # Used by the nursery.start trickiness
     def _tasks_removed_by_adoption(self, tasks):
-        with self._might_change_effective_deadline():
-            self._tasks.difference_update(tasks)
+        self._tasks.difference_update(tasks)
 
     # Used by the nursery.start trickiness
     def _tasks_added_by_adoption(self, tasks):
@@ -610,6 +650,9 @@ class _TaskStatus:
             # And make a note to check for cancellation later
             munged_tasks.append(task)
 
+        # That should have removed all the children from the old nursery
+        assert not self._old_nursery._children
+
         # Tell all the cancel scopes about the change. (There are probably
         # some scopes in common between the two stacks, so some scopes will
         # get the same tasks removed and then immediately re-added. This is
@@ -619,8 +662,26 @@ class _TaskStatus:
         for cancel_scope in new_stack:
             cancel_scope._tasks_added_by_adoption(munged_tasks)
 
-        # That should have removed all the children from the old nursery
-        assert not self._old_nursery._children
+        # Moving child tasks' cancel scopes might have changed their effective
+        # grace periods -- poke them to update. This can change deadlines but
+        # doesn't deliver any cancellations.
+        if (
+            new_stack[-1].effective_grace_period
+            != old_stack[-1].effective_grace_period
+        ):
+            with ExitStack() as stack:
+                munged_scopes = set()
+                for task in munged_tasks:
+                    for scope in task._cancel_stack[len(new_stack):]:
+                        if scope.grace_period is not None:
+                            break
+                        if scope.cleanup_expired or not scope.cancel_called:
+                            continue
+                        if scope not in munged_scopes:
+                            munged_scopes.add(scope)
+                            stack.enter_context(
+                                scope._might_change_effective_deadline()
+                            )
 
         # After all the delicate surgery is done, check for cancellation in
         # all the tasks that had their cancel scopes munged. This can trigger
@@ -1304,8 +1365,9 @@ class Runner:
             async_fn, args, self.system_nursery, name, system_task=True
         )
 
-    async def init(self, async_fn, args):
+    async def init(self, async_fn, args, grace_period):
         async with open_nursery() as system_nursery:
+            system_nursery.cancel_scope.grace_period = grace_period
             self.system_nursery = system_nursery
             try:
                 self.main_task = self.spawn_impl(
@@ -1507,7 +1569,8 @@ def run(
     *args,
     clock=None,
     instruments=(),
-    restrict_keyboard_interrupt_to_checkpoints=False
+    restrict_keyboard_interrupt_to_checkpoints=False,
+    grace_period=0,
 ):
     """Run a trio-flavored async function, and return the result.
 
@@ -1564,6 +1627,14 @@ def run(
           main thread (this is a Python limitation), or if you use
           :func:`open_signal_receiver` to catch SIGINT.
 
+      grace_period (float): The :ref:`grace period
+          <cleanup-with-grace-period>`, in seconds, to use for
+          cancellations where no enclosing scope specifies one.
+          Default is zero (no grace period). Effectively this behaves
+          as if the body of :func:`async_fn`, and every system task,
+          were enclosed in a ``with
+          trio.CancelScope(grace_period=...):`` block.
+
     Returns:
       Whatever ``async_fn`` returns.
 
@@ -1614,7 +1685,7 @@ def run(
                 with closing(runner):
                     # The main reason this is split off into its own function
                     # is just to get rid of this extra indentation.
-                    run_impl(runner, async_fn, args)
+                    run_impl(runner, async_fn, args, grace_period)
             except TrioInternalError:
                 raise
             except BaseException as exc:
@@ -1642,7 +1713,7 @@ def run(
 _MAX_TIMEOUT = 24 * 60 * 60
 
 
-def run_impl(runner, async_fn, args):
+def run_impl(runner, async_fn, args, grace_period):
     __tracebackhide__ = True
 
     if runner.instruments:
@@ -1650,7 +1721,7 @@ def run_impl(runner, async_fn, args):
     runner.clock.start_clock()
     runner.init_task = runner.spawn_impl(
         runner.init,
-        (async_fn, args),
+        (async_fn, args, grace_period),
         None,
         "<init>",
         system_task=True,
@@ -1691,8 +1762,12 @@ def run_impl(runner, async_fn, args):
         while runner.deadlines:
             (deadline, _), cancel_scope = runner.deadlines.peekitem(0)
             if deadline <= now:
-                # This removes the given scope from runner.deadlines:
-                cancelled_tasks.update(cancel_scope._cancel_no_notify())
+                # This removes the given scope from runner.deadlines,
+                # or reinserts it with a later deadline if it has a
+                # grace period.
+                cancelled_tasks.update(
+                    cancel_scope._cancel_no_notify(deadline)
+                )
                 idle_primed = False
             else:
                 break
@@ -1872,7 +1947,8 @@ def current_effective_deadline():
             else:
                 deadline_from_cleanup_expired = min(
                     deadline_from_cleanup_expired,
-                    scope._cleanup_started_at + scope.effective_grace_period
+                    scope._cleanup_started_at
+                    + scope._local_effective_grace_period
                 )
         else:
             deadline = min(deadline, scope._deadline)
