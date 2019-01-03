@@ -674,10 +674,10 @@ objects.
    .. attribute:: grace_period
 
       Read-write, :class:`float`, default :data:`None`. Specifies the
-      length (in seconds) of the time interval after this scope
-      becomes cancelled during which cancel scopes nested inside this
-      one should be shielded from cancellation if their
-      :attr:`shield_during_cleanup` attribute is :data:`True`.
+      duration (in seconds) after this scope becomes cancelled during
+      which cancel scopes nested inside this one should be shielded
+      from cancellation if their :attr:`shield_during_cleanup`
+      attribute is :data:`True`.
 
       The default of :data:`None` means to inherit the
       :attr:`effective_grace_period` from the cancel scope immediately
@@ -686,6 +686,12 @@ objects.
       on, falling back to the ``grace_period`` argument to
       :func:`trio.run` (default zero) if none of our enclosing
       cancel scopes specified a grace period.
+
+      Changing the :attr:`grace_period` after a cancellation has
+      occurred (that did not specify its own grace period) will affect
+      the time at which :attr:`shield_during_cleanup` scopes become
+      cancelled, but will not make them un-cancelled if they've
+      already become cancelled.
 
    .. attribute:: effective_grace_period
 
@@ -728,7 +734,10 @@ objects.
       Cancel the work in this scope immediately, disregarding any grace
       period.
 
-      [...]
+      If this scope is not yet cancelled, :meth:`cancel_immediately`
+      behaves like ``cancel(grace_period=0)``. If the scope is
+      already cancelled, it forces the immediate expiry of any
+      grace period that might be outstanding.
 
    .. attribute:: cancelled_caught
 
@@ -780,7 +789,7 @@ objects.
       run to completion) from one where some cleanup code may have
       been interrupted.
 
-   .. method:: linked_child(*, deadline=math.inf, shield=None)
+   .. method:: linked_child(*, deadline=math.inf, shield=None, shield_during_cleanup=None, grace_period=None)
 
       Return another :class:`CancelScope` object that automatically
       becomes cancelled when this one does. We say that the returned
@@ -792,17 +801,34 @@ objects.
       linked child is one-way: if the parent cancel scope becomes
       cancelled, all of its linked children do too, but any of the
       children can independently become cancelled without affecting
-      the source. Each child has its own :attr:`deadline`, which is
+      the parent. Each child has its own :attr:`deadline`, which is
       :data:`math.inf` (not inherited from the parent scope) if the
-      ``deadline`` argument is unspecified; the expiry of a linked
+      ``deadline`` argument is unspecified. The expiry of a linked
       child's deadline cancels that child only.
 
-      The new linked child inherits its initial :attr:`shield` attribute
-      from the parent, unless overridden via the ``shield`` argument.
-      The child :attr:`shield` may be changed without affecting the
-      parent, but changes to the parent :attr:`shield` will be
-      propagated to all children, overriding any local :attr:`shield`
-      value they've previously set.
+      The new linked child inherits its non-:attr:`deadline` mutable
+      attributes (:attr:`shield`, :attr:`shield_during_cleanup`,
+      :attr:`grace_period`) from the parent, unless overridden by a
+      corresponding argument to :meth:`linked_child`.  The child's
+      version of these attributes may be changed without affecting the
+      parent, but changes to the parent's version will be propagated
+      to all children, overriding any local value they've previously
+      set.
+
+      Calling ``cancel(grace_period=...)`` on the parent uses the
+      given grace period for cancellations of each not-yet-cancelled
+      linked child too. Calling :meth:`cancel` with no
+      ``grace_period`` argument causes each not-yet-cancelled linked
+      child to be cancelled using its own
+      :attr:`effective_grace_period`.  Calling
+      :meth:`cancel_immediately` on the parent has the effect of
+      calling it on all linked children too.
+
+      Cancel scope operations are atomic even when linked children
+      are involved. For example, if multiple scopes are to become
+      cancelled due to a single call to :meth:`cancel`, they all
+      become cancelled before any of the tasks inside them are
+      notified of the cancellation.
 
       Multiple layers of cancel scope linkage are supported.  The
       cancellation of any parent scope affects all its linked
@@ -833,6 +859,12 @@ situation of just wanting to impose a timeout on some code:
 
 .. autofunction:: fail_at
    :with: cancel_scope
+
+And one for marking blocking cleanup code that should take advantage of
+any grace period that might exist if it's cancelled:
+
+.. autofunction:: shield_during_cleanup
+   :with:
 
 Cheat sheet:
 

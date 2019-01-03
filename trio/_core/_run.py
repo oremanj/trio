@@ -1984,7 +1984,7 @@ async def checkpoint_if_cancelled():
 
     Equivalent to (but potentially more efficient than)::
 
-        if trio.current_deadline() == -inf:
+        if trio.current_effective_deadline() == -inf:
             await trio.hazmat.checkpoint()
 
     This is either a no-op, or else it allow other tasks to be scheduled and

@@ -10,27 +10,36 @@ __all__ = [
     "sleep",
     "fail_at",
     "fail_after",
+    "shield_during_cleanup",
     "TooSlowError",
 ]
 
 
-def move_on_at(deadline):
+def move_on_at(deadline, *, grace_period=None):
     """Use as a context manager to create a cancel scope with the given
     absolute deadline.
 
     Args:
       deadline (float): The deadline.
+      grace_period (float): The number of additional seconds to permit
+          code in :func:`shield_during_cleanup` blocks within this
+          scope to run after this scope becomes cancelled. If unspecified,
+          inherit the grace period from the cancel scope enclosing this one.
 
     """
-    return _core.CancelScope(deadline=deadline)
+    return _core.CancelScope(deadline=deadline, grace_period=grace_period)
 
 
-def move_on_after(seconds):
+def move_on_after(seconds, *, grace_period=None):
     """Use as a context manager to create a cancel scope whose deadline is
     set to now + *seconds*.
 
     Args:
       seconds (float): The timeout.
+      grace_period (float): The number of additional seconds to permit
+          code in :func:`shield_during_cleanup` blocks within this
+          scope to run after this scope becomes cancelled. If unspecified,
+          inherit the grace period from the cancel scope enclosing this one.
 
     Raises:
       ValueError: if timeout is less than zero.
@@ -39,7 +48,9 @@ def move_on_after(seconds):
 
     if seconds < 0:
         raise ValueError("timeout must be non-negative")
-    return move_on_at(_core.current_time() + seconds)
+    return move_on_at(
+        _core.current_time() + seconds, grace_period=grace_period
+    )
 
 
 async def sleep_forever():
@@ -94,7 +105,7 @@ class TooSlowError(Exception):
 
 
 @contextmanager
-def fail_at(deadline):
+def fail_at(deadline, *, grace_period=None):
     """Creates a cancel scope with the given deadline, and raises an error if it
     is actually cancelled.
 
@@ -112,13 +123,13 @@ def fail_at(deadline):
 
     """
 
-    with move_on_at(deadline) as scope:
+    with move_on_at(deadline, grace_period=grace_period) as scope:
         yield scope
     if scope.cancelled_caught:
         raise TooSlowError
 
 
-def fail_after(seconds):
+def fail_after(seconds, *, grace_period=None):
     """Creates a cancel scope with the given timeout, and raises an error if
     it is actually cancelled.
 
@@ -137,4 +148,26 @@ def fail_after(seconds):
     """
     if seconds < 0:
         raise ValueError("timeout must be non-negative")
-    return fail_at(_core.current_time() + seconds)
+    return fail_at(_core.current_time() + seconds, grace_period=grace_period)
+
+
+def shield_during_cleanup():
+    """Use as a context manager to mark code that should be allowed to
+    run for a bit longer after a cancel scope that surrounds it becomes
+    cancelled.
+
+    The exact amount of additional time is specified by the ``grace_period``
+    argument to the :meth:`~trio.CancelScope.cancel` call that caused the
+    cancellation, or by the :attr:`~trio.CancelScope.grace_period` attribute
+    of the cancel scope. This is intended for use with cleanup code that
+    might run while a :exc:`~trio.Cancelled` exception is propagating
+    (e.g. in ``finally`` blocks or ``__aexit__`` handlers) for which an
+    orderly shutdown requires blocking.
+
+    The default grace period is *zero*, and code that uses
+    :func:`shield_during_cleanup` must still be prepared for
+    a possible cancellation.  Use a cancel scope with the
+    :attr:`~trio.CancelScope.shield` attribute set to :data:`True` if
+    you really need to definitely not be interrupted.
+    """
+    return trio.CancelScope(shield_during_cleanup=True)
