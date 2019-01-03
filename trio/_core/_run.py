@@ -21,7 +21,7 @@ from async_generator import isasyncgen
 from sortedcontainers import SortedDict
 from outcome import Error, Value, capture
 
-from . import _public, _local
+from . import _public
 from ._entry_queue import EntryQueue, TrioToken
 from ._exceptions import (TrioInternalError, RunFinishedError, Cancelled)
 from ._ki import (
@@ -1577,7 +1577,7 @@ def run(
     clock=None,
     instruments=(),
     restrict_keyboard_interrupt_to_checkpoints=False,
-    grace_period=0,
+    grace_period=0
 ):
     """Run a trio-flavored async function, and return the result.
 
