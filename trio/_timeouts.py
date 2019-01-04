@@ -173,4 +173,4 @@ def shield_during_cleanup():
     you really need to definitely not be interrupted.
 
     """
-    return trio.CancelScope(shield_during_cleanup=True)
+    return _core.CancelScope(shield_during_cleanup=True)
