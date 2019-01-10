@@ -16,7 +16,7 @@ class _KqueueStatistics:
 
 
 @attr.s(slots=True, cmp=False, hash=False)
-class KqueueIOManager:
+class KqueueIOManager(_core._run.BaseIOManager):
     _kqueue = attr.ib(default=attr.Factory(select.kqueue))
     # {(ident, filter): Task or UnboundedQueue}
     _registered = attr.ib(default=attr.Factory(dict))

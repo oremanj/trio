@@ -119,7 +119,7 @@ class CompletionKeyEventInfo:
     dwNumberOfBytesTransferred = attr.ib()
 
 
-class WindowsIOManager:
+class WindowsIOManager(_core._run.BaseIOManager):
     def __init__(self):
         # https://msdn.microsoft.com/en-us/library/windows/desktop/aa363862(v=vs.85).aspx
         self._closed = True

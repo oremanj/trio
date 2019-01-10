@@ -392,7 +392,8 @@ def traceback_exception_init(
         self.embedded = []
 
 
-traceback.TracebackException.__init__ = traceback_exception_init
+# setattr to work around https://github.com/python/mypy/issues/2427
+setattr(traceback.TracebackException, "__init__", traceback_exception_init)
 traceback_exception_original_format = traceback.TracebackException.format
 
 
@@ -406,7 +407,7 @@ def traceback_exception_format(self, *, chain=True):
         )
 
 
-traceback.TracebackException.format = traceback_exception_format
+setattr(traceback.TracebackException, "format", traceback_exception_format)
 
 
 def trio_excepthook(etype, value, tb):

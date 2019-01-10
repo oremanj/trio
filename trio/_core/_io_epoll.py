@@ -41,7 +41,7 @@ class EpollWaiters:
 
 
 @attr.s(slots=True, cmp=False, hash=False)
-class EpollIOManager:
+class EpollIOManager(_core._run.BaseIOManager):
     _epoll = attr.ib(default=attr.Factory(select.epoll))
     # {fd: EpollWaiters}
     _registered = attr.ib(default=attr.Factory(dict))

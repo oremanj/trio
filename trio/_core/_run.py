@@ -8,6 +8,7 @@ import threading
 from collections import deque
 import collections.abc
 from contextlib import contextmanager, closing
+from typing import Type, cast
 
 from contextvars import copy_context
 from math import inf
@@ -47,6 +48,13 @@ __all__ = [
 ]
 
 GLOBAL_RUN_CONTEXT = threading.local()
+
+class BaseIOManager:
+    def close(self) -> None: pass
+    def statistics(self) -> object: pass
+    def handle_io(self, timeout: float) -> None: pass
+
+TheIOManager = cast(Type[BaseIOManager], None)
 
 if os.name == "nt":
     from ._io_windows import WindowsIOManager as TheIOManager
