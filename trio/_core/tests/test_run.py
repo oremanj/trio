@@ -924,11 +924,16 @@ async def test_cancel_linked_children(autojump_clock):
                     nursery.start_soon(worker, depth - 1, child.linked_child())
                     await worker(depth - 1, child.linked_child())
 
+    def collect_linked_children(cancel_scope):
+        for child in cancel_scope._linked_children:
+            yield child
+            yield from collect_linked_children(child)
+
     with _core.CancelScope() as root, fail_after(1):
         async with _core.open_nursery() as nursery:
             nursery.start_soon(worker, 3, root.linked_child())
             await wait_all_tasks_blocked()
-            all_children = list(root.linked_children)
+            all_children = list(collect_linked_children(root))
             # One child created from the linked_child() call in this block
             # Three from the single worker(3)
             # Three from each of three worker(2) = 9 total
@@ -936,8 +941,8 @@ async def test_cancel_linked_children(autojump_clock):
             assert len(all_children) == 1 + 3 + 9 + 27
             root.cancel()
 
-    # Test the logic to delay notifying any tasks affected by a cancel()
-    # until all cancel_called members are updated
+    # Make sure "simultaneous" cancellation always propagates to the
+    # outermost scope
     assert root.cancelled_caught and root.cancel_called
     assert not any(child.cancelled_caught for child in all_children)
     assert all(child.cancel_called for child in all_children)
@@ -952,14 +957,14 @@ async def test_cancel_linked_children(autojump_clock):
                 toplevel_children.append(root.linked_child())
                 nursery.start_soon(worker, 2, toplevel_children[-1])
             await wait_all_tasks_blocked()
-            all_children = list(root.linked_children)
-    assert root.cancel_called
+            all_children = list(collect_linked_children(root))
+    assert not root.cancel_called
     assert not root.cancelled_caught
     assert all(child.cancel_called for child in all_children)
     for child in all_children:
         assert child.cancelled_caught == (child in toplevel_children)
 
-    # Childes can have their own deadline
+    # Children can have their own deadline
     with _core.CancelScope(deadline=_core.current_time() + 2) as root:
         with root.linked_child() as child:
             child.deadline = _core.current_time() + 1
@@ -967,6 +972,39 @@ async def test_cancel_linked_children(autojump_clock):
             await sleep_forever()
     assert child.cancel_called and child.cancelled_caught
     assert not root.cancel_called and not root.cancelled_caught
+
+    # Changing parent's deadline affects child's effective deadline
+    start = _core.current_time()
+    root = _core.CancelScope(deadline=start + 2)
+    with root.linked_child(deadline=start + 1) as child:
+        assert _core.current_effective_deadline() == pytest.approx(start + 1)
+        root.deadline -= 1.5
+        assert _core.current_effective_deadline() == pytest.approx(start + 0.5)
+        assert child.deadline == pytest.approx(start + 1)
+        await sleep_forever()
+    assert _core.current_time() == pytest.approx(start + 0.5)
+    assert child.cancel_called and child.cancelled_caught
+
+    # Linked children of a cancelled scope start out cancelled
+    assert child.linked_child().cancel_called
+
+    # A scope with no tasks in it doesn't actually get cancel() called on
+    # deadline expiry (because #320)
+    assert not root.cancel_called and not root.cancelled_caught
+    with root.linked_child():
+        assert _core.current_effective_deadline() == pytest.approx(start + 0.5)
+
+    # Make sure cancellations propagate along a chain of linked children
+    # even if there are no outside references to something in the chain
+    root = _core.CancelScope()
+    with root.linked_child().linked_child().linked_child() as child:
+        gc_collect_harder()
+        root.deadline = _core.current_time()
+        assert _core.current_effective_deadline() == _core.current_time()
+        root.cancel()
+        assert child.cancel_called
+        await sleep_forever()
+    assert child.cancelled_caught
 
     # Linked children inherit shielding from the parent, can change
     # independently but parent's later changes will override
@@ -985,8 +1023,8 @@ async def test_cancel_linked_children(autojump_clock):
             assert root.linked_child().shield
             assert not root.linked_child(shield=False).shield
 
-    # Unshielding occurs simultaneously for all linked children
-    # affected by the .shield = False operation
+    # Unshielding logically occurs simultaneously for all linked
+    # children affected by the .shield = False operation
 
     shielded = _core.CancelScope(shield=True)
     cancelled = _core.CancelScope()
@@ -1018,7 +1056,7 @@ async def test_cancel_linked_children(autojump_clock):
     #     outer_shield: shielded
     #       inner_cancelled: cancelled
     #         inner_shield: not shielded
-    # and it would be delivered a cancellation for inner_cancelled.
+    # and it could catch a cancellation at inner_cancelled.
     # We assert that both tasks receive cancellations for outer_cancelled,
     # which could only happen if the unshielding happens simultaneously.
 

@@ -9,7 +9,7 @@ class GracefulShutdownManager:
         self._root_scope.cancel()
 
     def cancel_on_graceful_shutdown(self):
-        return self._root_scope.open_branch()
+        return self._root_scope.linked_child()
 
     @property
     def shutting_down(self):
@@ -30,8 +30,8 @@ async def stream_handler(stream):
 
 # To trigger the shutdown:
 async def listen_for_shutdown_signals():
-    with trio.catch_signals({signal.SIGINT, signal.SIGTERM}) as signal_aiter:
-        async for batch in signal_aiter:
+    with trio.open_signal_receiver(signal.SIGINT, signal.SIGTERM) as signal_aiter:
+        async for sig in signal_aiter:
             gsm.start_shutdown()
             break
         # TODO: it'd be nice to have some logic like "if we get another
@@ -39,7 +39,7 @@ async def listen_for_shutdown_signals():
         # That's easy enough:
         #
         # with trio.move_on_after(30):
-        #     async for batch in signal_aiter:
+        #     async for sig in signal_aiter:
         #         break
         # sys.exit()
         #

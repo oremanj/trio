@@ -6,6 +6,7 @@ import random
 import select
 import sys
 import threading
+import weakref
 from collections import deque
 import collections.abc
 from contextlib import contextmanager, closing
@@ -183,17 +184,31 @@ class CancelScope:
 
     _tasks = attr.ib(factory=set, init=False)
     _scope_task = attr.ib(default=None, init=False)
-    _effective_deadline = attr.ib(default=inf, init=False)
     cancel_called = attr.ib(default=False, init=False)
     cancelled_caught = attr.ib(default=False, init=False)
+
+    # The time at which this cancel scope logically becomes cancelled:
+    # the minimum deadline of this cancel scope and any of its linked
+    # parents, recursively. This is inf if cancel() has already been
+    # called.
+    _effective_deadline = attr.ib(default=inf, init=False)
+
+    # The deadline that is associated with this cancel scope in
+    # Runner.deadlines: _effective_deadline if self._tasks is
+    # nonempty, else inf (meaning "not registered").
+    _registered_deadline = attr.ib(default=inf, init=False)
 
     # Most cancel scopes don't have linked children; those that do
     # will replace this empty tuple with a WeakSet
     _linked_children = attr.ib(default=(), init=False)
+    _linked_parent = attr.ib(default=None, init=False)
 
     # Constructor arguments:
     _deadline = attr.ib(default=inf, kw_only=True)
     _shield = attr.ib(default=False, kw_only=True)
+
+    def __attrs_post_init__(self):
+        self._effective_deadline = self._deadline
 
     @enable_ki_protection
     def __enter__(self):
@@ -209,8 +224,8 @@ class CancelScope:
             )
         self._scope_task = task
         self.cancelled_caught = False
-        with self._might_change_effective_deadline():
-            self._add_task(task)
+        self._add_task(task)
+        self._update_computed_deadlines()  # we now have some tasks
         return self
 
     @enable_ki_protection
@@ -238,26 +253,51 @@ class CancelScope:
                 value.__context__ = old_context
 
     def linked_child(self, *, deadline=inf, shield=None):
+        """Return another :class:`CancelScope` object that automatically
+        becomes cancelled when this one does.
+
+        We say that the returned cancel scope is a "linked child" of
+        this "parent" cancel scope.  Note that this relationship has
+        nothing to do with lexical nesting of ``with`` blocks.
+
+        The relationship between the parent cancel scope and its new
+        linked child is one-way: if the parent cancel scope becomes
+        cancelled, all of its linked children do too, but any of the
+        children can independently become cancelled without affecting
+        the parent. Each child has its own :attr:`deadline`, which is
+        :data:`math.inf` (not inherited from the parent scope) if the
+        ``deadline`` argument is unspecified; the expiry of a linked
+        child's deadline cancels that child only, while the expiry of
+        the parent's deadline cancels the parent as well as all linked
+        children.
+
+        The new linked child inherits its initial :attr:`shield` attribute
+        from the parent, unless overridden via the ``shield`` argument.
+        The child :attr:`shield` may be changed without affecting the
+        parent, but changes to the parent :attr:`shield` will be
+        propagated to all children, overriding any local :attr:`shield`
+        value they've previously set.
+
+        Multiple layers of cancel scope linkage are supported.  The
+        cancellation of any parent scope affects all its linked
+        children, all their linked children, and so on.
+
+        """
+
         if self._linked_children == ():
             # We keep _linked_children as an empty tuple until the
             # first linked_child is created, to avoid creating a
             # fairly heavyweight WeakSet on every cancel scope object
-            with self._might_change_effective_deadline():
-                self._linked_children = weakref.WeakSet()
+            self._linked_children = weakref.WeakSet()
 
-        if shield is None:
-            shield = self._shield
-        child = CancelScope(deadline=deadline, shield=shield)
-        if self.cancel_called:
-            child.cancel()
+        child = CancelScope()
+        child._linked_parent = self
         self._linked_children.add(child)
+        child._deadline = deadline
+        child._shield = shield if shield is not None else self._shield
+        child.cancel_called = self.cancel_called
+        child._update_computed_deadlines()
         return child
-
-    @property
-    def linked_children(self):
-        for child in self._linked_children:
-            yield child
-            yield from child.linked_children
 
     def __repr__(self):
         if self._scope_task is None:
@@ -285,7 +325,7 @@ class CancelScope:
                 )
 
         if self._linked_children:
-            count = sum(1 for _ in self.linked_children)
+            count = len(self._linked_children)
             linked_children = ", {} linked child{}".format(
                 count, "ren" if count > 1 else ""
             )
@@ -296,27 +336,44 @@ class CancelScope:
             id(self), binding, state, linked_children
         )
 
-    @contextmanager
     @enable_ki_protection
-    def _might_change_effective_deadline(self):
-        try:
-            yield
-        finally:
-            old = self._effective_deadline
-            ever_had_linked_children = self._linked_children != ()
-            if self.cancel_called or (
-                not self._tasks and not ever_had_linked_children
-            ):
-                new = inf
-            else:
-                new = self._deadline
-            if old != new:
-                self._effective_deadline = new
-                runner = GLOBAL_RUN_CONTEXT.runner
-                if old != inf:
-                    del runner.deadlines[old, id(self)]
-                if new != inf:
-                    runner.deadlines[new, id(self)] = self
+    def _update_computed_deadlines(self):
+        """Recompute self._effective_deadline, and update our linked
+        children if it changed. Recompute self._registered_deadline,
+        and update the Runner.deadlines map if it changed.
+
+        Call this after changing self._deadline, self.cancel_called,
+        or bool(self._tasks).
+        """
+        old_effective = self._effective_deadline
+        old_registered = self._registered_deadline
+
+        if self.cancel_called:
+            new_effective = inf
+        else:
+            new_effective = self._deadline
+            if self._linked_parent is not None:
+                new_effective = min(
+                    new_effective, self._linked_parent._effective_deadline
+                )
+
+        if not self._tasks:
+            new_registered = inf
+        else:
+            new_registered = new_effective
+
+        if old_effective != new_effective:
+            self._effective_deadline = new_effective
+            for child in self._linked_children:
+                child._update_computed_deadlines()
+
+        if old_registered != new_registered:
+            self._registered_deadline = new_registered
+            runner = GLOBAL_RUN_CONTEXT.runner
+            if old_registered != inf:
+                del runner.deadlines[old_registered, id(self)]
+            if new_registered != inf:
+                runner.deadlines[new_registered, id(self)] = self
 
     @property
     def deadline(self):
@@ -346,8 +403,8 @@ class CancelScope:
 
     @deadline.setter
     def deadline(self, new_deadline):
-        with self._might_change_effective_deadline():
-            self._deadline = float(new_deadline)
+        self._deadline = float(new_deadline)
+        self._update_computed_deadlines()
 
     @property
     def shield(self):
@@ -378,20 +435,12 @@ class CancelScope:
     def shield(self, new_value):
         if not isinstance(new_value, bool):
             raise TypeError("shield must be a bool")
-
-        # Set shielding for us and all linked children, then check
-        # cancellations for us and all linked children if shielding
-        # was turned off. This ordering ensures that each task
-        # receives the cancellation for its outermost cancelled scope.
         self._shield = new_value
-        for child in self.linked_children:
-            child._shield = new_value
         if not self._shield:
             for task in self._tasks:
                 task._attempt_delivery_of_any_pending_cancel()
-            for child in self.linked_children:
-                for task in child._tasks:
-                    task._attempt_delivery_of_any_pending_cancel()
+        for child in self._linked_children:
+            child.shield = new_value
 
     @enable_ki_protection
     def cancel(self):
@@ -402,10 +451,10 @@ class CancelScope:
         """
         if self.cancel_called:
             return
-        with self._might_change_effective_deadline():
-            self.cancel_called = True
         for child in self._linked_children:
             child.cancel()
+        self.cancel_called = True
+        self._update_computed_deadlines()
         for task in self._tasks:
             task._attempt_delivery_of_any_pending_cancel()
 
@@ -415,13 +464,16 @@ class CancelScope:
 
     def _remove_task(self, task):
         self._tasks.remove(task)
-        assert task._cancel_stack[-1] is self
+        try:
+            assert task._cancel_stack[-1] is self
+        except Exception as exc:
+            import pdb; pdb.set_trace()
         task._cancel_stack.pop()
 
     # Used by the nursery.start trickiness
     def _tasks_removed_by_adoption(self, tasks):
-        with self._might_change_effective_deadline():
-            self._tasks.difference_update(tasks)
+        self._tasks.difference_update(tasks)
+        self._update_computed_deadlines()  # in case we now have no tasks
 
     # Used by the nursery.start trickiness
     def _tasks_added_by_adoption(self, tasks):
@@ -439,8 +491,8 @@ class CancelScope:
     def _close(self, exc):
         if exc is not None:
             exc = MultiError.filter(self._exc_filter, exc)
-        with self._might_change_effective_deadline():
-            self._remove_task(self._scope_task)
+        self._remove_task(self._scope_task)
+        self._update_computed_deadlines()  # we should now have no tasks
         self._scope_task = None
         return exc
 
@@ -1746,7 +1798,7 @@ def current_effective_deadline():
             deadline = inf
         if scope.cancel_called:
             deadline = -inf
-        deadline = min(deadline, scope._deadline)
+        deadline = min(deadline, scope._effective_deadline)
     return deadline
 
 
