@@ -9,7 +9,7 @@ import threading
 import weakref
 from collections import deque
 import collections.abc
-from contextlib import contextmanager, closing
+from contextlib import contextmanager, closing, ExitStack
 
 from contextvars import copy_context
 from math import inf
@@ -177,14 +177,18 @@ class CancelScope:
     deadline, see the :meth:`linked_child` method.
 
     The :class:`CancelScope` constructor takes initial values for the
-    cancel scope's :attr:`deadline` and :attr:`shield` attributes; these
-    may be freely modified after construction, whether or not the scope
-    has been entered yet, and changes take immediate effect.
+    cancel scope's :attr:`deadline`, :attr:`shield`,
+    :attr:`shield_during_cleanup`, and :attr:`grace_period`
+    attributes; these may be freely modified after construction,
+    whether or not the scope has been entered yet, and changes take
+    immediate effect.
+
     """
 
     _tasks = attr.ib(factory=set, init=False)
     _scope_task = attr.ib(default=None, init=False)
     cancel_called = attr.ib(default=False, init=False)
+    cleanup_expired = attr.ib(default=False, init=False)
     cancelled_caught = attr.ib(default=False, init=False)
 
     # The time at which this cancel scope logically becomes cancelled:
@@ -198,6 +202,9 @@ class CancelScope:
     # nonempty, else inf (meaning "not registered").
     _registered_deadline = attr.ib(default=inf, init=False)
 
+    _cleanup_started_at = attr.ib(default=inf, init=False)
+    _local_grace_period = attr.ib(default=None, init=False)
+
     # Most cancel scopes don't have linked children; those that do
     # will replace this empty tuple with a WeakSet
     _linked_children = attr.ib(default=(), init=False)
@@ -206,6 +213,8 @@ class CancelScope:
     # Constructor arguments:
     _deadline = attr.ib(default=inf, kw_only=True)
     _shield = attr.ib(default=False, kw_only=True)
+    _shield_during_cleanup = attr.ib(default=False, kw_only=True)
+    _grace_period = attr.ib(default=None, kw_only=True)
 
     def __attrs_post_init__(self):
         self._effective_deadline = self._deadline
@@ -252,7 +261,14 @@ class CancelScope:
                 assert value is remaining_error_after_cancel_scope
                 value.__context__ = old_context
 
-    def linked_child(self, *, deadline=inf, shield=None):
+    def linked_child(
+        self,
+        *,
+        deadline=inf,
+        shield=None,
+        shield_during_cleanup=None,
+        grace_period=None,
+    ):
         """Return another :class:`CancelScope` object that automatically
         becomes cancelled when this one does.
 
@@ -271,12 +287,24 @@ class CancelScope:
         the parent's deadline cancels the parent as well as all linked
         children.
 
-        The new linked child inherits its initial :attr:`shield` attribute
-        from the parent, unless overridden via the ``shield`` argument.
-        The child :attr:`shield` may be changed without affecting the
-        parent, but changes to the parent :attr:`shield` will be
-        propagated to all children, overriding any local :attr:`shield`
-        value they've previously set.
+        The new linked child inherits its non-:attr:`deadline` mutable
+        attributes (:attr:`shield`, :attr:`~CancelScope.shield_during_cleanup`,
+        :attr:`grace_period`) from the parent, unless overridden by a
+        corresponding argument to :meth:`linked_child`.  The child's
+        version of these attributes may be changed without affecting the
+        parent, but changes to the parent's version will be propagated
+        to all children, overriding any local value they've previously
+        set.
+
+        If a linked child is created from a scope that is already
+        cancelled, the child is considered to have been cancelled at the
+        same time as its parent was. If the child's effective grace
+        period is different from the parent's, this may result in a
+        different time at which the grace period is considered to
+        expire.  A per-cancellation grace period specified with
+        ``cancel(grace_period=...)`` is propagated to linked children as
+        well, including those that don't yet exist at the time of the
+        call to :meth:`cancel`.
 
         Multiple layers of cancel scope linkage are supported.  The
         cancellation of any parent scope affects all its linked
@@ -290,12 +318,23 @@ class CancelScope:
             # fairly heavyweight WeakSet on every cancel scope object
             self._linked_children = weakref.WeakSet()
 
+        if shield is None:
+            shield = self._shield
+        if shield_during_cleanup is None:
+            shield_during_cleanup = self._shield_during_cleanup
+        if grace_period is None:
+            grace_period = self._grace_period
+
         child = CancelScope()
         child._linked_parent = self
         self._linked_children.add(child)
         child._deadline = deadline
-        child._shield = shield if shield is not None else self._shield
-        child.cancel_called = self.cancel_called
+        child._shield = shield
+        child._shield_during_cleanup = shield_during_cleanup
+        child._grace_period = grace_period
+        if self.cancel_called:
+            child.cancel_called = True
+            child._local_grace_period = self._local_grace_period
         child._update_computed_deadlines()
         return child
 
@@ -309,20 +348,25 @@ class CancelScope:
                     len(self._tasks) - 1, "s" if len(self._tasks) > 2 else ""
                 )
 
-        if self.cancel_called:
+        if self.cleanup_expired:
             state = ", cancelled"
-        elif self.deadline == inf:
-            state = ""
+        elif self.cancel_called:
+            state = ", cancelled pending cleanup"
         else:
+            state = ""
+
+        if self._effective_deadline != inf:
             try:
                 now = current_time()
             except RuntimeError:  # must be called from async context
-                state = ""
+                deadline = ""
             else:
-                state = ", deadline is {:.2f} seconds {}".format(
+                deadline = ", deadline is {:.2f} seconds {}".format(
                     abs(self.deadline - now),
                     "from now" if self.deadline >= now else "ago"
                 )
+        else:
+            deadline = ""
 
         if self._linked_children:
             count = len(self._linked_children)
@@ -332,8 +376,8 @@ class CancelScope:
         else:
             linked_children = ""
 
-        return "<trio.CancelScope at {:#x}, {}{}{}>".format(
-            id(self), binding, state, linked_children
+        return "<trio.CancelScope at {:#x}, {}{}{}{}>".format(
+            id(self), binding, state, deadline, linked_children
         )
 
     @enable_ki_protection
@@ -348,8 +392,13 @@ class CancelScope:
         old_effective = self._effective_deadline
         old_registered = self._registered_deadline
 
-        if self.cancel_called:
+        if self.cleanup_expired:
             new_effective = inf
+        elif self.cancel_called:
+            new_effective = (
+                self._cleanup_started_at +
+                self._local_effective_grace_period
+            )
         else:
             new_effective = self._deadline
             if self._linked_parent is not None:
@@ -431,31 +480,253 @@ class CancelScope:
         return self._shield
 
     @shield.setter
-    @enable_ki_protection
     def shield(self, new_value):
+        self._set_shield("_shield", new_value)
+
+    @property
+    def shield_during_cleanup(self):
+        """Read-write, :class:`bool`, default :data:`False`. Like
+        :attr:`shield`, but instead of shielding this scope from outside
+        cancellations indefinitely, it only shields until the outside
+        cancellation's :attr:`grace_period` expires. This allows for
+        :ref:`blocking cleanup <cleanup-with-grace-period>` whose maximum
+        duration is specified externally.
+
+        You can set both :attr:`shield` and
+        :attr:`~CancelScope.shield_during_cleanup` independently, but
+        :attr:`shield` offers strictly more protection, so if
+        :attr:`shield` is :data:`True` then the value of
+        :attr:`~CancelScope.shield_during_cleanup` doesn't matter.
+        """
+        return self._shield_during_cleanup
+
+    @shield_during_cleanup.setter
+    def shield_during_cleanup(self, new_value):
+        self._set_shield("_shield_during_cleanup", new_value)
+
+    @enable_ki_protection
+    def _set_shield(self, attr, new_value):
         if not isinstance(new_value, bool):
             raise TypeError("shield must be a bool")
-        self._shield = new_value
-        if not self._shield:
+        setattr(self, "_" + attr, new_value)
+        if not new_value:
             for task in self._tasks:
                 task._attempt_delivery_of_any_pending_cancel()
         for child in self._linked_children:
-            child.shield = new_value
+            setattr(child, attr, new_value)
+
+    @property
+    def grace_period(self):
+        """Read-write, :class:`float`, default :data:`None`. Specifies the
+        duration (in seconds) after this scope becomes cancelled during
+        which cancel scopes nested inside this one should be shielded
+        from cancellation if their :attr:`~CancelScope.shield_during_cleanup`
+        attribute is :data:`True`.
+
+        The default of :data:`None` means to inherit the
+        :attr:`effective_grace_period` from the cancel scope immediately
+        enclosing this one. If it also has a :attr:`grace_period` of
+        :data:`None`, it will ask its own immediate parent, and so
+        on, falling back to the ``grace_period`` argument to
+        :func:`trio.run` (default zero) if none of our enclosing
+        cancel scopes specified a grace period.
+
+        Changing the :attr:`grace_period` after a cancellation has
+        occurred (that did not specify its own grace period) will affect
+        the future time at which the cancellation proceeds into
+        :func:`shield_during_cleanup` scopes, but will not re-protect
+        them if the previous grace period already expired.
+        """
+        return self._grace_period
+
+    @grace_period.setter
+    @enable_ki_protection
+    def grace_period(self, new_grace_period):
+        if new_grace_period is not None:
+            new_grace_period = float(new_grace_period)
+            if new_grace_period < 0:
+                raise ValueError("grace period must be >= 0")
+
+        for child in self._linked_children:
+            child.grace_period = new_grace_period
+
+        self._grace_period = new_grace_period
+        self._grace_period_updated()
+
+    def _grace_period_updated(self):
+        if self._scope_task is None:
+            return
+
+        # Changing the grace period affects deadlines for all scopes
+        # that are in their cleanup window, nested within this scope,
+        # and not nested within a deeper scope whose grace period isn't
+        # changing.
+        with ExitStack() as stack:
+            if self.cancel_called and not self.cleanup_expired:
+                stack.enter_context(self._might_change_effective_deadline())
+
+            my_index = self._scope_task._cancel_stack.index(self)
+            affected_scopes = set()
+            for task in self._tasks:
+                assert task._cancel_stack[my_index] is self
+                for scope in task._cancel_stack[my_index + 1:]:
+                    if scope in affected_scopes:
+                        continue
+                    if scope.grace_period is not None:
+                        break
+                    if scope.cancel_called and not scope.cleanup_expired:
+                        stack.enter_context(
+                            scope._might_change_effective_deadline()
+                        )
+                        affected_scopes.add(scope)
+
+    @grace_period.deleter
+    def grace_period(self):
+        self.grace_period = None
+
+    @property
+    def effective_grace_period(self):
+        """Read-only, :class:`float`. The grace period that would be used
+        if this scope were cancelled right now. This has the same value
+        as :attr:`grace_period` if :attr:`grace_period` is not :data:`None`,
+        and otherwise reflects the :attr:`effective_grace_period` of the
+        cancel scope that immediately encloses this one's ``with`` block.
+        If the ``with`` block is not active and no :attr:`grace_period` was
+        specified, the :attr:`effective_grace_period` is :data:`None`.
+        """
+        if self._grace_period is not None:
+            return self._grace_period
+        if self._scope_task is None:
+            return None
+
+        effective_grace_period = 0
+        for scope in self._scope_task._cancel_stack:
+            if scope._grace_period is not None:
+                effective_grace_period = scope._grace_period
+            if scope is self:
+                break
+        else:  # pragma: no cover
+            raise AssertionError("cancel stack corrupted")
+        return effective_grace_period
+
+    @property
+    def _local_effective_grace_period(self):
+        if self._local_grace_period is not None:
+            return self._local_grace_period
+        return self.effective_grace_period
+
+    def _cancel_no_notify(self, as_of):
+        # returns the affected tasks
+        if not self.cancel_called:
+            # Initial cancellation applies to us and all linked_children.
+            with self._might_change_effective_deadline():
+                self.cancel_called = True
+                self._cleanup_started_at = as_of
+                if self._local_effective_grace_period == 0:
+                    # If we have no grace period, switch immediately
+                    # to hard-cancel mode.
+                    self.cleanup_expired = True
+
+            affected_tasks = self._tasks
+            if self._linked_children:
+                affected_tasks = set(affected_tasks)
+                for child in self._linked_children:
+                    if not child.cancel_called:
+                        affected_tasks.update(child._cancel_no_notify(as_of))
+
+        elif not self.cleanup_expired:
+            # Second cancellation represents expiration of the grace
+            # period for cleanup. It applies only to this cancel
+            # scope; our linked_children might have their own grace periods,
+            # and our initial cancellation started those clocks
+            # running.
+            with self._might_change_effective_deadline():
+                self.cleanup_expired = True
+            affected_tasks = self._tasks
+
+        else:  # pragma: no cover
+            # An additional cancellation after we're already
+            # hard-cancelled doesn't do anything further.
+            # (We shouldn't actually be able to get here, because
+            # the user-facing interfaces check cancel_called before
+            # entering _cancel_no_notify, and the deadline manager
+            # won't call us because we won't register a deadline
+            # after cleanup_expired.)
+            return set()
 
     @enable_ki_protection
-    def cancel(self):
-        """Cancels this scope immediately.
+    def cancel(self, *, grace_period=None):
+        """Cancel the work in this scope.
 
         This method is idempotent, i.e., if the scope was already
-        cancelled then this method silently does nothing.
+        cancelled then this method silently does nothing (even if the
+        previous cancellation used a different grace period). If the
+        scope was not already cancelled, the cancellation proceeds
+        as follows:
+
+        * A grace period for this cancellation is determined. This is the
+          value of the ``grace_period`` argument if it was specified,
+          or the current :attr:`effective_grace_period` if not.
+
+        * Work within this scope that is not within a nested
+          :func:`shield_during_cleanup` scope is cancelled immediately.
+
+        * Work within this scope that is within a nested
+          :func:`shield_during_cleanup` scope is cancelled
+          after the expiry of the grace period for this cancellation,
+          or immediately if the grace period is zero.
+
+        A grace period specified as an argument to :func:`cancel` will
+        not be inherited by other cancel scopes and cannot be changed
+        via assignment to the :attr:`CancelScope.grace_period` attribute.
         """
         if self.cancel_called:
             return
+
+        if grace_period is not None:
+            self._local_grace_period = grace_period
+            for child in self.linked_children:
+                if not child.cancel_called:
+                    child._local_grace_period = grace_period
+
         for child in self._linked_children:
             child.cancel()
         self.cancel_called = True
         self._update_computed_deadlines()
         for task in self._tasks:
+            task._attempt_delivery_of_any_pending_cancel()
+
+    def _cancel_immediately_no_notify(self, as_of):
+        if self.cleanup_expired:
+            return set()
+
+        with self._might_change_effective_deadline():
+            if not self.cancel_called:
+                self.cancel_called = True
+                self._cleanup_started_at = as_of
+            self.cleanup_expired = True
+            self._local_grace_period = 0
+
+        affected_tasks = self._tasks
+        if self._linked_children:
+            affected_tasks = set(affected_tasks)
+            for child in self._linked_children:
+                affected_tasks.update(
+                    child._cancel_immediately_no_notify(as_of)
+                )
+        return affected_tasks
+
+    @enable_ki_protection
+    def cancel_immediately(self):
+        """Cancel the work in this scope immediately, disregarding any grace
+        period.
+
+        If this scope is not yet cancelled, :meth:`cancel_immediately`
+        behaves like ``cancel(grace_period=0)``. If the scope is
+        already cancelled, it forces the immediate expiry of any
+        grace period that might be outstanding.
+        """
+        for task in self._cancel_immediately_no_notify(_core.current_time()):
             task._attempt_delivery_of_any_pending_cancel()
 
     def _add_task(self, task):
@@ -569,6 +840,9 @@ class _TaskStatus:
             # And make a note to check for cancellation later
             munged_tasks.append(task)
 
+        # That should have removed all the children from the old nursery
+        assert not self._old_nursery._children
+
         # Tell all the cancel scopes about the change. (There are probably
         # some scopes in common between the two stacks, so some scopes will
         # get the same tasks removed and then immediately re-added. This is
@@ -578,8 +852,14 @@ class _TaskStatus:
         for cancel_scope in new_stack:
             cancel_scope._tasks_added_by_adoption(munged_tasks)
 
-        # That should have removed all the children from the old nursery
-        assert not self._old_nursery._children
+        # Moving child tasks' cancel scopes might have changed their effective
+        # grace periods -- poke them to update. This can change deadlines but
+        # doesn't deliver any cancellations.
+        if (
+            new_stack[-1].effective_grace_period !=
+            old_stack[-1].effective_grace_period
+        ):
+            new_stack[-1]._grace_period_updated()
 
         # After all the delicate surgery is done, check for cancellation in
         # all the tasks that had their cancel scopes munged. This can trigger
@@ -682,7 +962,16 @@ class Nursery:
 
     def _add_exc(self, exc):
         self._pending_excs.append(exc)
-        self.cancel_scope.cancel()
+        if isinstance(exc, _core.Cancelled):
+            # A cancellation that propagates out of a task must be
+            # associated with some cancel scope in the nursery's cancel
+            # stack. If that scope is cancelled, it's cancelled for all
+            # tasks in the nursery, and adding our own cancellation on
+            # top of that (with a potentially different grace period)
+            # just confuses things.
+            pass
+        else:
+            self.cancel_scope.cancel()
 
     def _check_nursery_closed(self):
         if not any(
@@ -766,15 +1055,37 @@ class Nursery:
 
 
 def _pending_cancel_scope(cancel_stack):
-    # Return the outermost exception that is is not outside a shield.
+    # Return the outermost of the following two possibilities:
+    # - the outermost cancel scope in cleanup state (cancel_called and not
+    #   cleanup_expired) that is not outside a shield_during_cleanup
+    # - the outermost cancel scope in fully-cancelled state
+    #   (cleanup_expired, which implies also cancel_called)
+    #   that is not outside any kind of shield
+
     pending_scope = None
+    pending_with_cleanup_expired = None
+
     for scope in cancel_stack:
-        # Check shield before _exc, because shield should not block
-        # processing of *this* scope's exception
-        if scope.shield:
+        # Check shielding before cancellation state, because shield
+        # should not block processing of *this* scope's exception
+        if scope._shield:
+            # Full shield: nothing outside this scope can affect a task
+            # that is currently executing code inside the scope.
             pending_scope = None
+            pending_with_cleanup_expired = None
+
+        if scope._shield_during_cleanup:
+            # Shield during cleanup: only cancel scopes with cleanup_expired
+            # outside this scope can affect a task that's executing code
+            # inside it.
+            pending_scope = pending_with_cleanup_expired
+
         if pending_scope is None and scope.cancel_called:
             pending_scope = scope
+
+        if pending_with_cleanup_expired is None and scope.cleanup_expired:
+            pending_with_cleanup_expired = scope
+
     return pending_scope
 
 
@@ -1239,10 +1550,11 @@ class Runner:
             async_fn, args, self.system_nursery, name, system_task=True
         )
 
-    async def init(self, async_fn, args):
+    async def init(self, async_fn, args, grace_period):
         async with open_nursery() as system_nursery:
             self.system_nursery = system_nursery
             try:
+                system_nursery.cancel_scope.grace_period = grace_period
                 self.main_task = self.spawn_impl(
                     async_fn, args, system_nursery, None
                 )
@@ -1442,7 +1754,8 @@ def run(
     *args,
     clock=None,
     instruments=(),
-    restrict_keyboard_interrupt_to_checkpoints=False
+    restrict_keyboard_interrupt_to_checkpoints=False,
+    grace_period=0
 ):
     """Run a trio-flavored async function, and return the result.
 
@@ -1499,6 +1812,14 @@ def run(
           main thread (this is a Python limitation), or if you use
           :func:`open_signal_receiver` to catch SIGINT.
 
+      grace_period (float): The :ref:`grace period
+          <cleanup-with-grace-period>`, in seconds, to use for
+          cancellations where no enclosing scope specifies one.
+          Default is zero (no grace period). Effectively this behaves
+          as if the body of ``async_fn``, and every system task,
+          were enclosed in a ``with
+          trio.CancelScope(grace_period=...):`` block.
+
     Returns:
       Whatever ``async_fn`` returns.
 
@@ -1549,7 +1870,7 @@ def run(
                 with closing(runner):
                     # The main reason this is split off into its own function
                     # is just to get rid of this extra indentation.
-                    run_impl(runner, async_fn, args)
+                    run_impl(runner, async_fn, args, grace_period)
             except TrioInternalError:
                 raise
             except BaseException as exc:
@@ -1577,7 +1898,7 @@ def run(
 _MAX_TIMEOUT = 24 * 60 * 60
 
 
-def run_impl(runner, async_fn, args):
+def run_impl(runner, async_fn, args, grace_period):
     __tracebackhide__ = True
 
     if runner.instruments:
@@ -1585,7 +1906,7 @@ def run_impl(runner, async_fn, args):
     runner.clock.start_clock()
     runner.init_task = runner.spawn_impl(
         runner.init,
-        (async_fn, args),
+        (async_fn, args, grace_period),
         None,
         "<init>",
         system_task=True,
@@ -1623,8 +1944,10 @@ def run_impl(runner, async_fn, args):
         while runner.deadlines:
             (deadline, _), cancel_scope = runner.deadlines.peekitem(0)
             if deadline <= now:
-                # This removes the given scope from runner.deadlines:
-                cancel_scope.cancel()
+                # This removes the given scope from runner.deadlines,
+                # or reinserts it with a later deadline if it has a
+                # grace period.
+                cancel_scope.cancel(as_of=deadline)
                 idle_primed = False
             else:
                 break
@@ -1793,12 +2116,30 @@ def current_effective_deadline():
     """
     task = current_task()
     deadline = inf
+    cleanup_expiry = inf
+
     for scope in task._cancel_stack:
         if scope._shield:
-            deadline = inf
+            deadline = cleanup_expiry = inf
+        if scope._shield_during_cleanup:
+            deadline = cleanup_expiry
+
         if scope.cancel_called:
             deadline = -inf
-        deadline = min(deadline, scope._effective_deadline)
+            if scope.cleanup_expired:
+                cleanup_expiry = -inf
+            else:
+                cleanup_expiry = min(
+                    cleanup_expiry, scope._cleanup_started_at +
+                    scope._local_effective_grace_period
+                )
+        else:
+            deadline = min(deadline, scope._effective_deadline)
+            cleanup_expiry = min(
+                cleanup_expiry,
+                scope._deadline + scope._local_effective_grace_period
+            )
+
     return deadline
 
 
@@ -1826,7 +2167,7 @@ async def checkpoint_if_cancelled():
 
     Equivalent to (but potentially more efficient than)::
 
-        if trio.current_deadline() == -inf:
+        if trio.current_effective_deadline() == -inf:
             await trio.hazmat.checkpoint()
 
     This is either a no-op, or else it allow other tasks to be scheduled and

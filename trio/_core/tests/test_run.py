@@ -18,7 +18,7 @@ from async_generator import async_generator
 from .tutil import check_sequence_matches, gc_collect_harder
 from ... import _core
 from ..._threads import run_sync_in_worker_thread
-from ..._timeouts import sleep, fail_after
+from ..._timeouts import sleep, fail_after, shield_during_cleanup
 from ..._util import aiter_compat
 from ...testing import (
     wait_all_tasks_blocked,
@@ -1059,6 +1059,419 @@ async def test_cancel_linked_children(autojump_clock):
     # and it could catch a cancellation at inner_cancelled.
     # We assert that both tasks receive cancellations for outer_cancelled,
     # which could only happen if the unshielding happens simultaneously.
+
+
+async def test_cancel_graceful(autojump_clock):
+    start = _core.current_time()
+    cleanup_start = None
+    cleanup_finish = None
+
+    # nested scopes, outer one's grace period expires first
+    with _core.CancelScope(deadline=start + 1, grace_period=1) as outer:
+        with _core.CancelScope(deadline=start + 1.5, grace_period=2) as inner:
+            try:
+                await sleep(10)
+            finally:
+                cleanup_start = _core.current_time()
+                with shield_during_cleanup():
+                    assert "cancelled pending cleanup" in repr(outer)
+                    assert not inner.cancel_called
+                    assert outer.cancel_called and not outer.cleanup_expired
+                    try:
+                        await sleep(5)
+                    finally:
+                        cleanup_finish = _core.current_time()
+
+    assert cleanup_start == pytest.approx(start + 1)
+    assert cleanup_finish == pytest.approx(cleanup_start + 1)
+    assert outer.cancelled_caught and not inner.cancelled_caught
+    assert outer.cancel_called and outer.cleanup_expired
+    assert inner.cancel_called and not inner.cleanup_expired
+
+    # now the inner one's grace period expires first even though the outer
+    # was cancelled first
+    start = _core.current_time()
+    with _core.CancelScope(deadline=start + 1, grace_period=1) as outer:
+        with _core.CancelScope(
+            deadline=start + 1.5, grace_period=0.3
+        ) as inner:
+            try:
+                await sleep(10)
+            finally:
+                cleanup_start = _core.current_time()
+                with shield_during_cleanup():
+                    try:
+                        await sleep(5)
+                    finally:
+                        cleanup_finish = _core.current_time()
+
+    assert cleanup_start == pytest.approx(start + 1)
+    assert cleanup_finish == pytest.approx(cleanup_start + 0.8)
+    assert not outer.cancelled_caught and inner.cancelled_caught
+    assert outer.cancel_called and not outer.cleanup_expired
+    assert inner.cancel_called and inner.cleanup_expired
+
+    # cancel can specify grace period, idempotent even if grace period changes
+    start = _core.current_time()
+    with _core.CancelScope() as scope:
+        scope.cancel(grace_period=0.5)
+        assert scope.cancel_called and not scope.cleanup_expired
+        scope.cancel(grace_period=2)
+        assert scope.cancel_called and not scope.cleanup_expired
+
+        with pytest.raises(_core.Cancelled):
+            await sleep(5)
+        assert _core.current_time() == pytest.approx(start)
+
+        with pytest.raises(_core.Cancelled):
+            with shield_during_cleanup():
+                await sleep(5)
+        assert _core.current_time() == pytest.approx(start + 0.5)
+        assert scope.cleanup_expired
+
+    async def canary(*, task_status=_core.TASK_STATUS_IGNORED):
+        start = _core.current_time()
+        with pytest.raises(_core.Cancelled):
+            with shield_during_cleanup() as scope:
+                task_status.started(scope)
+                await sleep(5)
+        assert _core.current_time() == pytest.approx(start + 0.5)
+
+    # if grace period is zero, cancellation of shield_during_cleanup scopes
+    # is instantaneous
+    async with _core.open_nursery() as nursery:
+        shield_scope = await nursery.start(canary)
+        await sleep(0.5)
+        nursery.cancel_scope.cancel()
+        nursery.cancel_scope.grace_period = 1  # no effect bc already expired
+        assert nursery.cancel_scope.cleanup_expired
+
+    # grace period changes after cancel do work
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(canary)
+        nursery.cancel_scope.grace_period = 0.3
+        nursery.cancel_scope.cancel()
+        with _core.CancelScope(shield=True):
+            await sleep(0.2)
+        assert not nursery.cancel_scope.cleanup_expired
+        nursery.cancel_scope.grace_period = 0.5
+
+    # even via linked children
+    root = _core.CancelScope(grace_period=0.3)
+    with root.linked_child() as scope:
+        async with _core.open_nursery() as nursery:
+            nursery.start_soon(canary)
+            root.grace_period = 0.3
+            nursery.cancel_scope.cancel()
+            with _core.CancelScope(shield=True):
+                await sleep(0.2)
+            assert not nursery.cancel_scope.cleanup_expired
+            root.grace_period = 0.5
+
+    # even if they need to propagate to an inner scope that inherited
+    # the grace period that's changing
+
+    async def canary_thrice(*, task_status):
+        async with _core.open_nursery() as nursery:
+            task_status.started(nursery.cancel_scope)
+            nursery.start_soon(canary)
+            nursery.start_soon(canary)
+            await canary()
+
+    with _core.CancelScope(grace_period=0.3) as scope:
+        async with _core.open_nursery() as nursery:
+            sub_scopes = [
+                await nursery.start(canary_thrice),
+                await nursery.start(canary_thrice),
+                await nursery.start(canary_thrice),
+            ]
+            for sub_scope in sub_scopes:
+                sub_scope.cancel()
+            with _core.CancelScope(shield=True):
+                await sleep(0.2)
+            scope.grace_period = 0.5
+
+    # but not if the old grace period already expired
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(canary)
+        await sleep(0.3)
+        nursery.cancel_scope.grace_period = 0.2
+        nursery.cancel_scope.cancel()
+        with _core.CancelScope(shield=True):
+            await sleep(0.3)
+        assert nursery.cancel_scope.cleanup_expired
+        nursery.cancel_scope.grace_period = 0.5
+        assert nursery.cancel_scope.cleanup_expired
+
+    # assigning to grace_period doesn't affect cancel(grace_period=...)
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(canary)
+        await sleep(0.2)
+        nursery.cancel_scope.cancel(grace_period=0.3)
+        with _core.CancelScope(shield=True):
+            await sleep(0.2)
+        assert not nursery.cancel_scope.cleanup_expired
+        nursery.cancel_scope.grace_period = 0.5
+
+    # cancel(grace_period=...) is inherited by linked children
+    root = _core.CancelScope()
+    with root.linked_child() as scope:
+        async with _core.open_nursery() as nursery:
+            nursery.start_soon(canary)
+            await sleep(0.2)
+            root.cancel(grace_period=0.3)
+            root.cancel(grace_period=0.4)  # still idempotent
+
+    # even those that aren't created yet
+    root = _core.CancelScope(grace_period=1)
+    root.cancel(grace_period=0.7)
+    assert root.grace_period == 1  # per-cancel attribute is per-cancel
+    await sleep(0.2)
+    with root.linked_child() as scope:
+        async with _core.open_nursery() as nursery:
+            nursery.start_soon(canary)
+            # cleanup expires 0.7sec after root was cancelled = 0.5sec
+            # after canary started
+
+    # or are created but not yet entered
+    root = _core.CancelScope(grace_period=1)
+    scope = root.linked_child()
+    root.cancel(grace_period=0.7)
+    await sleep(0.2)
+    with scope:
+        async with _core.open_nursery() as nursery:
+            nursery.start_soon(canary)
+            # cleanup expires 0.7sec after root was cancelled = 0.5sec
+            # after canary started
+
+    # unless they already have a cancel going with a different grace period
+    root = _core.CancelScope()
+    with root.linked_child() as scope:
+        async with _core.open_nursery() as nursery:
+            nursery.start_soon(canary)
+            await sleep(0.2)
+            scope.cancel(grace_period=0.3)
+            root.cancel(grace_period=1)
+
+    # cleanup_expired is not set after the with block is exited
+    with _core.CancelScope(grace_period=0.5) as scope:
+        scope.cancel()
+        with shield_during_cleanup():
+            await sleep(0.3)
+    await sleep(1)
+    assert scope.cancel_called and not scope.cleanup_expired
+    with scope, _core.CancelScope(shield=True):
+        assert not scope.cleanup_expired
+        await _core.checkpoint()
+        assert scope.cleanup_expired
+
+    # cancel of an unbound scope sets the cancel time immediately but
+    # the grace period is determined when it's entered
+    start = _core.current_time()
+    inner = _core.CancelScope(grace_period=42)
+    inner.cancel()
+    del inner.grace_period
+    assert inner.grace_period is None
+    await sleep(0.5)
+    with _core.CancelScope(grace_period=1) as outer:
+        with inner:
+            with shield_during_cleanup():
+                await sleep(5)
+    assert _core.current_time() == pytest.approx(start + 1)
+
+    # basic test of cancel_immediately
+    async with _core.open_nursery() as nursery:
+        nursery.cancel_scope.grace_period = 1
+        nursery.start_soon(canary)
+        await sleep(0.2)
+        nursery.cancel_scope.cancel()
+        with _core.CancelScope(shield=True):
+            await sleep(0.3)
+        nursery.cancel_scope.cancel_immediately()
+        nursery.cancel_scope.cancel_immediately()  # idempotent
+
+    # cancel_immediately with no preceding cancel
+    async with _core.open_nursery() as nursery:
+        nursery.cancel_scope.grace_period = 1
+        nursery.start_soon(canary)
+        await sleep(0.5)
+        nursery.cancel_scope.cancel_immediately()
+
+    # removing shield_during_cleanup during the grace period wakes up
+    # the affected task(s)
+    async with _core.open_nursery() as nursery:
+        nursery.cancel_scope.grace_period = 1
+        shield_scope = await nursery.start(canary)
+        nursery.cancel_scope.cancel()
+        with _core.CancelScope(shield=True):
+            await sleep(0.5)
+        assert shield_scope.shield_during_cleanup
+        shield_scope.shield_during_cleanup = False
+        assert not shield_scope.shield_during_cleanup
+
+    # moving a task tree via nursery.start() updates the grace periods
+    # correctly, even if the cancel already started
+
+    async def child(*, task_status):
+        async with _core.open_nursery() as nursery:
+            sub_scopes = [
+                await nursery.start(canary_thrice),
+                await nursery.start(canary_thrice),
+                await nursery.start(canary_thrice),
+            ]
+            for scope in sub_scopes:
+                assert scope.effective_grace_period == 1
+                scope.cancel()
+            task_status.started(sub_scopes)
+            for scope in sub_scopes:
+                assert scope.effective_grace_period == 0.5
+
+    async def recipient(*, task_status):
+        async with _core.open_nursery() as nursery:
+            nursery.cancel_scope.grace_period = 0.5
+            task_status.started(nursery)
+            await wait_all_tasks_blocked()
+
+    start = _core.current_time()
+    async with _core.open_nursery() as top_nursery:
+        recipient_nursery = await top_nursery.start(recipient)
+        with _core.CancelScope(grace_period=1):
+            sub_scopes = await recipient_nursery.start(child)
+    assert _core.current_time() == pytest.approx(start + 0.5)
+
+
+def test_grace_period_inheritance():
+    async def check_in_system_task(default_grace):
+        with _core.CancelScope() as scope:
+            assert scope.effective_grace_period == default_grace
+
+    async def main(default_grace):
+        _core.spawn_system_task(check_in_system_task, default_grace)
+
+        with _core.CancelScope() as outer:
+            with _core.CancelScope() as inner:
+                assert outer.grace_period is inner.grace_period is None
+                assert outer.effective_grace_period == default_grace
+                assert inner.effective_grace_period == default_grace
+
+                outer.grace_period = 1
+                assert outer.grace_period == outer.effective_grace_period == 1
+                assert inner.grace_period is None
+                assert inner.effective_grace_period == 1
+
+                inner.grace_period = 2
+                assert outer.grace_period == outer.effective_grace_period == 1
+                assert inner.grace_period == inner.effective_grace_period == 2
+
+                del outer.grace_period
+                assert outer.grace_period is None
+                assert outer.effective_grace_period == default_grace
+                assert inner.grace_period == inner.effective_grace_period == 2
+
+                inner.grace_period = None
+                assert inner.grace_period is None
+                assert inner.effective_grace_period == default_grace
+
+    _core.run(main, 0.42, grace_period=0.42)
+    _core.run(main, 0, grace_period=0)
+    _core.run(main, 0, grace_period=None)
+
+    with pytest.raises(ValueError) as exc_info:
+        _core.run(main, -1, grace_period=-1)
+    assert str(exc_info.value) == "grace period must be >= 0"
+
+
+async def test_grace_period_linked_children(autojump_clock):
+    async def worker(depth, scope):
+        with scope:
+            if depth == 0:
+                with shield_during_cleanup():
+                    await sleep_forever()
+            else:
+                async with _core.open_nursery() as nursery:
+                    nursery.start_soon(worker, depth - 1, scope.linked_child())
+                    nursery.start_soon(worker, depth - 1, scope.linked_child())
+                    await worker(depth - 1, scope.linked_child())
+
+    # regular cancel
+    start = _core.current_time()
+    root = _core.CancelScope()
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(worker, 3, root)
+        root.cancel(grace_period=0.5)
+    assert _core.current_time() == pytest.approx(start + 0.5)
+
+    # cancel_immediately
+    start = _core.current_time()
+    root = _core.CancelScope()
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(worker, 3, root)
+        root.cancel(grace_period=0.5)
+        await sleep(0.2)
+        root.cancel_immediately()
+    assert _core.current_time() == pytest.approx(start + 0.2)
+
+    # cancel_immediately after some children already cancelled
+    start = _core.current_time()
+    root = _core.CancelScope()
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(worker, 3, root)
+        for idx, child in enumerate(root.linked_children):
+            if idx % 5 == 0:
+                child.cancel(grace_period=1)
+        await sleep(0.2)
+        root.cancel_immediately()
+    assert _core.current_time() == pytest.approx(start + 0.2)
+
+    # inheritance of grace period attributes by linked children
+    root = _core.CancelScope(grace_period=1)
+    assert root.linked_child().grace_period == 1
+    assert root.linked_child(grace_period=1).grace_period == 1
+    assert root.linked_child(grace_period=2).grace_period == 2
+
+    root = _core.CancelScope(shield_during_cleanup=True)
+    assert root.linked_child().shield_during_cleanup
+    assert root.linked_child(shield_during_cleanup=True).shield_during_cleanup
+    assert not root.linked_child(
+        shield_during_cleanup=False
+    ).shield_during_cleanup
+
+
+async def test_grace_period_effective_deadline(autojump_clock):
+    start = _core.current_time()
+    with _core.CancelScope(deadline=start + 1, grace_period=2) as outer:
+        with _core.CancelScope(deadline=start + 2, grace_period=0.5) as inner:
+            assert _core.current_effective_deadline() == start + 1
+            inner.shield_during_cleanup = True
+            assert _core.current_effective_deadline() == start + 2
+            with shield_during_cleanup():
+                assert _core.current_effective_deadline() == start + 2.5
+                inner.grace_period = 5
+                assert _core.current_effective_deadline() == start + 3
+                inner.shield_during_cleanup = False
+                assert _core.current_effective_deadline() == start + 3
+            assert _core.current_effective_deadline() == start + 1
+            outer.deadline += 2
+            assert _core.current_effective_deadline() == start + 2
+            outer.deadline -= 2
+            assert _core.current_effective_deadline() == start + 1
+            inner.shield = True
+            assert _core.current_effective_deadline() == start + 2
+            with shield_during_cleanup() as scope:
+                assert _core.current_effective_deadline() == start + 7
+                scope.shield = True
+                assert _core.current_effective_deadline() == inf
+                scope.shield = False
+                inner.cancel()
+                assert _core.current_effective_deadline() == start + 5
+            assert _core.current_effective_deadline() == -inf
+            with shield_during_cleanup():
+                inner.grace_period = 3
+                assert _core.current_effective_deadline() == start + 3
+                outer.cancel_immediately()
+                assert _core.current_effective_deadline() == start + 3
+                inner.shield = False
+                assert _core.current_effective_deadline() == -inf
 
 
 async def test_timekeeping():
