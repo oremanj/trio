@@ -86,7 +86,7 @@ async def cancellable_waiter(name, lot, scopes, record):
         scopes[name] = scope
         record.append("sleep {}".format(name))
         try:
-            await lot.park()
+            await lot.park(name)
         except _core.Cancelled:
             record.append("cancelled {}".format(name))
         else:
@@ -121,6 +121,94 @@ async def test_parking_lot_cancel():
             "sleep 3",
             "cancelled 2",
             {"wake 1", "wake 3"},
+        ]
+    )
+
+
+async def test_parking_lot_conditional_wakeups():
+    record = []
+    scopes = {}
+
+    async with _core.open_nursery() as nursery:
+        lot = ParkingLot()
+        nursery.start_soon(cancellable_waiter, 1, lot, scopes, record)
+        await wait_all_tasks_blocked()
+        nursery.start_soon(cancellable_waiter, 2, lot, scopes, record)
+        await wait_all_tasks_blocked()
+        nursery.start_soon(cancellable_waiter, 3, lot, scopes, record)
+        await wait_all_tasks_blocked()
+        nursery.start_soon(cancellable_waiter, 4, lot, scopes, record)
+        await wait_all_tasks_blocked()
+        nursery.start_soon(cancellable_waiter, 5, lot, scopes, record)
+        await wait_all_tasks_blocked()
+        nursery.start_soon(cancellable_waiter, 6, lot, scopes, record)
+        await wait_all_tasks_blocked()
+        nursery.start_soon(cancellable_waiter, 7, lot, scopes, record)
+        await wait_all_tasks_blocked()
+        nursery.start_soon(cancellable_waiter, 8, lot, scopes, record)
+        await wait_all_tasks_blocked()
+        assert len(record) == 8
+
+        for count in (-1, 0):
+            assert not lot.unpark_if(bool, count=count)
+            assert not lot.unpark_matching(bool, count=count)
+
+        def is_even(n):
+            return n % 2 == 0
+
+        # next in line (1) isn't even, so no wakeups
+        assert not lot.unpark_if(is_even)
+        await wait_all_tasks_blocked()
+        assert len(record) == 8
+
+        # wake up 2 and 4, limited by count
+        # now lot is [1, 3, 5, 6, 7, 8]
+        assert 2 == len(lot.unpark_matching(is_even, count=2))
+        await wait_all_tasks_blocked()
+        assert len(record) == 10
+
+        # wake up 1, limited by count
+        # now lot is [3, 5, 6, 7, 8]
+        assert 1 == len(lot.unpark_if(lambda n: n <= 3))
+        await wait_all_tasks_blocked()
+        assert len(record) == 11
+
+        assert 2 == lot.count_matching(is_even)
+
+        # wake up 3 and 5, limited by condition
+        # now lot is [6, 7, 8]
+        assert 2 == len(lot.unpark_while(lambda n: not is_even(n)))
+        await wait_all_tasks_blocked()
+        assert len(record) == 13
+
+        # cancel 7; now lot is [6, 8]
+        scopes[7].cancel()
+        await wait_all_tasks_blocked()
+        assert len(record) == 14
+
+        # wake up 6 and 8
+        assert 2 == len(lot.unpark_while(is_even))
+        await wait_all_tasks_blocked()
+        assert len(record) == 16
+
+        assert not lot.unpark_if(is_even)
+        assert not lot.unpark_matching(is_even)
+
+    check_sequence_matches(
+        record, [
+            "sleep 1",
+            "sleep 2",
+            "sleep 3",
+            "sleep 4",
+            "sleep 5",
+            "sleep 6",
+            "sleep 7",
+            "sleep 8",
+            {"wake 2", "wake 4"},
+            "wake 1",
+            {"wake 3", "wake 5"},
+            "cancelled 7",
+            {"wake 6", "wake 8"},
         ]
     )
 
@@ -163,7 +251,8 @@ async def test_parking_lot_repark():
             "sleep 1", "sleep 2", "sleep 3", "wake 1", "cancelled 2"
         ]
 
-        lot2.unpark_all()
+        # make sure cookies are preserved during reparking
+        assert 1 == len(lot2.unpark_if(lambda n: n == 3))
         await wait_all_tasks_blocked()
         assert record == [
             "sleep 1", "sleep 2", "sleep 3", "wake 1", "cancelled 2", "wake 3"
