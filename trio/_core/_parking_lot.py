@@ -110,7 +110,7 @@ class ParkingLot:
               woken up. The function must not make reentrant calls to
               methods of this :class:`ParkingLot`.
 
-        Return:
+        Returns:
           The number of parked tasks whose cookies satisfy the condition.
 
         """
@@ -135,6 +135,10 @@ class ParkingLot:
               this might indicate whether the current task wants to acquire
               the lock as a reader or as a writer.
 
+        Returns:
+          The ``value`` passed to :meth:`unpark`, or ``None`` if no value was
+          specified or a different unparking mechanism was used.
+
         """
         task = _core.current_task()
         self._parked[task] = cookie
@@ -144,14 +148,16 @@ class ParkingLot:
             del task.custom_sleep_data._parked[task]
             return _core.Abort.SUCCEEDED
 
-        await _core.wait_task_rescheduled(abort_fn)
+        return await _core.wait_task_rescheduled(abort_fn)
+
+    # impound()?
 
     def _pop_several(self, count):
         for _ in range(min(count, len(self._parked))):
             yield self._parked.popitem(last=False)
 
     @_core.enable_ki_protection
-    def unpark(self, *, count=1):
+    def unpark(self, *, count=1, value=None):
         """Unpark one or more tasks.
 
         This wakes up ``count`` tasks that are blocked in :meth:`park`. If
@@ -159,7 +165,9 @@ class ParkingLot:
         many tasks as are available and then returns successfully.
 
         Args:
-          count (int): the number of tasks to unpark.
+          count (int): The number of tasks to unpark.
+          value (object): The value which should be returned from :meth:`park`
+              in each unparked task.
 
         Returns:
           A list of the tasks that were woken up.
@@ -167,7 +175,7 @@ class ParkingLot:
         """
         tasks = [task for task, cookie in self._pop_several(count)]
         for task in tasks:
-            _core.reschedule(task)
+            _core.reschedule(task, outcome.Value(value))
         return tasks
 
     def unpark_all(self):
