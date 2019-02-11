@@ -124,6 +124,147 @@ class SystemClock:
 ################################################################
 
 
+# Overview of cancellation internals:
+#
+# The lexical nesting of cancel scope 'with' blocks implies a "cancel
+# stack" for each task; entering a 'with' block pushes the new
+# CancelScope onto this imagined stack, and exiting the block pops
+# it. If you throw a Cancelled exception into a task, it passes
+# through each scope in that task's cancel stack in turn, from
+# newest/rightmost/top of stack to oldest/leftmost/bottom.
+#
+# A newly spawned task's cancel stack starts with the cancel stack
+# that was active when its parent nursery was opened, and on top of
+# that are added all of the cancel scopes that get entered by 'with'
+# blocks in the task itself. For example:
+#
+# @trio.run
+# async def main():
+#     # cancel stack here: []
+#     #   (technically [Runner.system_nursery.cancel_scope] but
+#     #    we'll ignore that one for purposes of this discussion)
+#
+#     async def child1():
+#         # cancel stack here: [outer, nursery.cancel_scope]
+#         await sleep_forever()
+#
+#     async def child2():
+#         with CancelScope() as child_inner:
+#             # cancel stack here: [outer, nursery.cancel_scope, child_inner]
+#             await sleep_forever()
+#
+#     with CancelScope() as outer:
+#         # cancel stack here: [outer]
+#         async with trio.open_nursery() as nursery:
+#             # cancel stack here: [outer, nursery.cancel_scope]
+#             nursery.start_soon(child1)
+#             nursery.start_soon(child2)
+#             with CancelScope() as inner:
+#                 # cancel stack here: [outer, nursery.cancel_scope, inner]
+#                 await sleep_forever()
+#             # cancel stack here: [outer, nursery.cancel_scope]
+#         # cancel stack here: [outer]
+#     # cancel stack here: []
+#
+# As long as we restrict ourselves to only entering each cancel scope in
+# a single 'with' block, it is easy to see that every cancel scope has
+# a single well-defined parent (next-further-out scope / scope that's to
+# its immediate left in a cancel stack) no matter which task you're
+# looking at. In the above example, the parent of inner and of child_inner
+# is nursery.cancel_scope, the parent of nursery.cancel_scope is outer,
+# and so on. Analogously, we can define the set of children of a cancel
+# scope as all of the cancel scopes that show up immediately to the
+# right of it in any task's cancel stack.
+#
+# Trio's standard cancellation semantics can be imagined as a function
+# that maps a cancel stack to at most one cancel scope, answering the
+# question: "if I throw in a Cancelled exception right now, where
+# should it propagate to?". If you look at a cancel stack from left
+# (oldest/outermost) to right (newest/innermost), the "pending cancel
+# scope" is the leftmost cancelled scope that is not to the left of
+# any shielded scope. If there is no such cancel scope, we shouldn't
+# raise Cancelled right now in the task that has this cancel stack.
+#
+# In the past, Trio would explicitly track the cancel stack for each
+# task and each nursery, as a list of CancelScopes, and would
+# determine anew the pending cancel scope for each task at each
+# checkpoint that it executed. This gets slower as you build more
+# deeply nested task trees, and makes it hard to extend the
+# cancellation semantics, so now the cancel stack is only a rhetorical
+# device.
+#
+# The current implementation looks like this:
+#
+# * Each task tracks its "current cancel scope", which is just the
+#   cancel scope at the top of its cancel stack (as defined
+#   above).  Most cancel scopes will be the current cancel scope for at
+#   most one task. The cancel scope that immediately surrounds a
+#   nursery will be the current cancel scope for each task in the
+#   nursery that has not yet entered any cancel scopes of its own, as
+#   well as potentially for the parent task of the nursery (if no
+#   cancel scopes have been entered inside the nursery 'async with'
+#   block).
+#
+# * We partition the set of cancel scopes into "cancel contexts". Each
+#   cancel context is rooted at a particular cancel scope, and contains
+#   that root scope as well as all of its child scopes, recursively,
+#   that will not become cancelled before the root scope does.
+#
+#   * More precisely: Given cancel scopes A and B such that A is the
+#     direct parent of B, B will either be in the same cancel context
+#     as A (which might be rooted at A or at some parent of A) or will
+#     be the root of its own context.  B will have its own context if
+#     it is cancelled and A is not, or if neither A nor B is cancelled
+#     and B's deadline is before A's, or if B is shielded. If none of
+#     these are true, B will share A's context.
+#
+#   * The tree of cancel contexts gets updated as necessary to
+#     maintain the invariant in the previous bullet point. For
+#     example, if cancel() is called on a cancel scope that is not the
+#     root of its cancel context and whose cancel context was not
+#     already cancelled, the scope on which cancel() was called and
+#     all of its transitive children (modulo shielding) will move to a
+#     new cancel context.
+#
+# * Each cancel context tracks the set of tasks for which it is the
+#   "controlling cancel context". This is the set of all tasks that
+#   have any cancel scope in the cancel context as their current
+#   cancel scope.  Correspondingly, each task has exactly one
+#   controlling cancel context, which is the cancel context that its
+#   current cancel scope is in.
+#
+# * When the root scope in a cancel context becomes cancelled, either
+#   explicitly or upon the expiry of its deadline, all the tasks for
+#   which that cancel context is controlling receive a cancellation.
+#
+# * When a task executes a checkpoint, it receives a cancellation iff
+#   its controlling cancel context's root scope is cancelled.
+#   (This check is O(1).)
+#
+# * current_effective_deadline() returns the deadline of the current
+#   task's controlling cancel context's root scope. (This check is
+#   also O(1).)
+#
+# * A Cancelled exception gets caught by any cancel scope that's at
+#   the root of its cancel context.
+#
+# * All of the "interesting" bits of Trio's cancellation semantics --
+#   the stuff that would need to change to support graceful cancellation,
+#   for example -- are entirely contained in the logic of how we answer
+#   the question "does this cancel scope need to be in a different cancel
+#   context than its parent?".
+
+
+@attr.s(cmp=False, repr=False, slots=True)
+class CancelContext:
+    root_scope = attr.ib()
+    scopes = attr.ib(factory=set, init=False)
+    tasks = attr.ib(factory=set, init=False)
+
+    def __attrs_post_init__(self):
+        self.add_scope(self.root_scope)
+
+
 @attr.s(cmp=False, repr=False, slots=True)
 class CancelScope:
     """A *cancellation scope*: the link between a unit of cancellable
@@ -164,10 +305,36 @@ class CancelScope:
     has been entered yet, and changes take immediate effect.
     """
 
+    # Cancel context that contains this cancel scope, or None if
+    # its 'with' block is not active (not yet entered, or already exited).
+    _context = attr.ib(default=None, init=False)
+
+    # Tasks for which this cancel scope is the current cancel scope.
     _tasks = attr.ib(factory=set, init=False)
+
+    # Parent of this cancel scope, or None if its 'with' block is not
+    # active
+    _parent = attr.ib(default=None, init=False)
+
+    # Immediate children of this cancel scope (empty if its 'with'
+    # block is not active)
+    _children = attr.ib(factory=set, init=False)
+
+    # True if we have already entered the 'with' block for this cancel
+    # scope and shouldn't permit reentry/reuse. Reentry can be
+    # distinguished from reuse based on whether _context is None.
     _has_been_entered = attr.ib(default=False, init=False)
-    _effective_deadline = attr.ib(default=inf, init=False)
+
+    # The time at which we have asked the Runner to call our cancel()
+    # method, or +inf if we have not registered such a time.
+    # Typically this is our deadline, but if our 'with' block is not
+    # active or we are already cancelled, it is +inf instead.
+    _registered_deadline = attr.ib(default=inf, init=False)
+
+    # True if our cancel() method has been called
     cancel_called = attr.ib(default=False, init=False)
+
+    # True if our 'with' block caught a Cancelled exception
     cancelled_caught = attr.ib(default=False, init=False)
 
     # Constructor arguments:
@@ -182,8 +349,11 @@ class CancelScope:
                 "Each CancelScope may only be used for a single 'with' block"
             )
         self._has_been_entered = True
+        self._parent = task.current_cancel_scope
+        task.current_cancel_scope = self
+
         if current_time() >= self._deadline:
-            self.cancel_called = True
+            self.cancel()
         with self._might_change_effective_deadline():
             self._add_task(task)
         return self
