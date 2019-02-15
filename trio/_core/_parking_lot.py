@@ -120,26 +120,19 @@ class ParkingLot:
     # if we ever add the ability to repark while one's resuming place in
     # line (for false wakeups), then we could have it return a ticket that
     # abstracts the "place in line" concept.
-    @_core.enable_ki_protection
-    async def park(self):
+    @_core.operation
+    def park(self):
         """Park the current task until woken by a call to :meth:`unpark` or
         :meth:`unpark_all`.
 
         """
-        task = _core.current_task()
-        self._parked[task] = None
-        task.custom_sleep_data = self
-
-        def abort_fn(_):
-            del task.custom_sleep_data._parked[task]
-            return _core.Abort.SUCCEEDED
-
-        await _core.wait_task_rescheduled(abort_fn)
-
-    def _pop_several(self, count):
-        for _ in range(min(count, len(self._parked))):
-            task, _ = self._parked.popitem(last=False)
-            yield task
+        handle = yield
+        self._parked[handle] = _core.current_task()
+        handle.custom_sleep_data = self
+        try:
+            yield
+        finally:
+            del handle.custom_sleep_data._parked[handle]
 
     @_core.enable_ki_protection
     def unpark(self, *, count=1):
@@ -153,9 +146,12 @@ class ParkingLot:
           count (int): the number of tasks to unpark.
 
         """
-        tasks = list(self._pop_several(count))
-        for task in tasks:
-            _core.reschedule(task)
+        tasks = []
+        while self._parked and count > 0:
+            handle, task = next(iter(self._parked.items()))
+            tasks.append(task)
+            handle.complete()
+            count -= 1
         return tasks
 
     def unpark_all(self):
@@ -200,9 +196,11 @@ class ParkingLot:
         """
         if not isinstance(new_lot, ParkingLot):
             raise TypeError("new_lot must be a ParkingLot")
-        for task in self._pop_several(count):
-            new_lot._parked[task] = None
-            task.custom_sleep_data = new_lot
+        while self._parked and count > 0:
+            handle, task = self._parked.popitem(last=False)
+            new_lot._parked[handle] = task
+            handle.custom_sleep_data = new_lot
+            count -= 1
 
     def repark_all(self, new_lot):
         """Move all parked tasks from one :class:`ParkingLot` object to

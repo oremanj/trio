@@ -61,16 +61,17 @@ class Event:
         """
         self._flag = False
 
-    async def wait(self):
+    @_core.operation
+    def wait(self):
         """Block until the internal flag value becomes True.
 
         If it's already True, then this method returns immediately.
 
         """
         if self._flag:
-            await _core.checkpoint()
+            return
         else:
-            await self._lot.park()
+            yield from self._lot.park.operation()
 
     def statistics(self):
         """Return an object containing debugging information.
@@ -226,22 +227,21 @@ class CapacityLimiter:
         """
         return self.total_tokens - self.borrowed_tokens
 
-    @_core.enable_ki_protection
-    def acquire_nowait(self):
-        """Borrow a token from the sack, without blocking.
+    @_core.operation
+    def acquire(self):
+        """Borrow a token from the sack, blocking if necessary.
 
         Raises:
-          WouldBlock: if no tokens are available.
           RuntimeError: if the current task already holds one of this sack's
               tokens.
 
         """
-        self.acquire_on_behalf_of_nowait(_core.current_task())
+        yield from self.acquire_on_behalf_of.operation(_core.current_task())
 
-    @_core.enable_ki_protection
-    def acquire_on_behalf_of_nowait(self, borrower):
-        """Borrow a token from the sack on behalf of ``borrower``, without
-        blocking.
+    @_core.operation
+    def acquire_on_behalf_of(self, borrower):
+        """Borrow a token from the sack on behalf of ``borrower``, blocking if
+        necessary.
 
         Args:
           borrower: A :class:`trio.hazmat.Task` or arbitrary opaque object
@@ -252,9 +252,8 @@ class CapacityLimiter:
              <https://github.com/python-trio/trio/issues/182>`__
 
         Raises:
-          WouldBlock: if no tokens are available.
-          RuntimeError: if ``borrower`` already holds one of this sack's
-              tokens.
+          RuntimeError: if ``borrower`` task already holds one of this sack's
+             tokens.
 
         """
         if borrower in self._borrowers:
@@ -264,51 +263,27 @@ class CapacityLimiter:
             )
         if len(self._borrowers) < self._total_tokens and not self._lot:
             self._borrowers.add(borrower)
-        else:
-            raise _core.WouldBlock
+            return
 
-    @_core.enable_ki_protection
-    async def acquire(self):
-        """Borrow a token from the sack, blocking if necessary.
-
-        Raises:
-          RuntimeError: if the current task already holds one of this sack's
-              tokens.
-
-        """
-        await self.acquire_on_behalf_of(_core.current_task())
-
-    @_core.enable_ki_protection
-    async def acquire_on_behalf_of(self, borrower):
-        """Borrow a token from the sack on behalf of ``borrower``, blocking if
-        necessary.
-
-        Args:
-          borrower: A :class:`trio.hazmat.Task` or arbitrary opaque object
-             used to record who is borrowing this token; see
-             :meth:`acquire_on_behalf_of_nowait` for details.
-
-        Raises:
-          RuntimeError: if ``borrower`` task already holds one of this sack's
-             tokens.
-
-        """
-        await _core.checkpoint_if_cancelled()
+        task = _core.current_task()
+        if task in self._pending_borrowers:
+            raise RuntimeError(
+                "can't select on two acquisitions from the same CapacityLimiter"
+            )
+        self._pending_borrowers[task] = borrower
         try:
-            self.acquire_on_behalf_of_nowait(borrower)
-        except _core.WouldBlock:
-            task = _core.current_task()
-            self._pending_borrowers[task] = borrower
-            try:
-                await self._lot.park()
-            except _core.Cancelled:
-                self._pending_borrowers.pop(task)
-                raise
+            yield from self._lot.park.operation()
         except:
-            await _core.cancel_shielded_checkpoint()
+            self._pending_borrowers.pop(task)
             raise
-        else:
-            await _core.cancel_shielded_checkpoint()
+
+    def acquire_nowait(self):
+        # TODO deprecation
+        return self.acquire.nowait()
+
+    def acquire_on_behalf_of_nowait(self, borrower):
+        # TODO deprecation
+        return self.acquire_on_behalf_of.nowait(borrower)
 
     @_core.enable_ki_protection
     def release(self):
@@ -436,33 +411,21 @@ class Semaphore:
         """
         return self._max_value
 
-    @_core.enable_ki_protection
     def acquire_nowait(self):
-        """Attempt to decrement the semaphore value, without blocking.
+        # TODO deprecation
+        return self.acquire.nowait()
 
-        Raises:
-          WouldBlock: if the value is zero.
+    @_core.operation
+    def acquire(self):
+        """Decrement the semaphore value, blocking if necessary to avoid
+        letting it drop below zero.
 
         """
         if self._value > 0:
             assert not self._lot
             self._value -= 1
         else:
-            raise _core.WouldBlock
-
-    @_core.enable_ki_protection
-    async def acquire(self):
-        """Decrement the semaphore value, blocking if necessary to avoid
-        letting it drop below zero.
-
-        """
-        await _core.checkpoint_if_cancelled()
-        try:
-            self.acquire_nowait()
-        except _core.WouldBlock:
-            await self._lot.park()
-        else:
-            await _core.cancel_shielded_checkpoint()
+            yield from self._lot.park.operation()
 
     @_core.enable_ki_protection
     def release(self):
@@ -541,15 +504,15 @@ class Lock:
         """
         return self._owner is not None
 
-    @_core.enable_ki_protection
     def acquire_nowait(self):
-        """Attempt to acquire the lock, without blocking.
+        # TODO deprecation
+        return self.acquire.nowait()
 
-        Raises:
-          WouldBlock: if the lock is held.
+    @_core.operation
+    def acquire(self):
+        """Acquire the lock, blocking if necessary.
 
         """
-
         task = _core.current_task()
         if self._owner is task:
             raise RuntimeError("attempt to re-acquire an already held Lock")
@@ -557,23 +520,10 @@ class Lock:
             # No-one owns it
             self._owner = task
         else:
-            raise _core.WouldBlock
-
-    @_core.enable_ki_protection
-    async def acquire(self):
-        """Acquire the lock, blocking if necessary.
-
-        """
-        await _core.checkpoint_if_cancelled()
-        try:
-            self.acquire_nowait()
-        except _core.WouldBlock:
             # NOTE: it's important that the contended acquire path is just
             # "_lot.park()", because that's how Condition.wait() acquires the
             # lock as well.
-            await self._lot.park()
-        else:
-            await _core.cancel_shielded_checkpoint()
+            yield from self._lot.park.operation()
 
     @_core.enable_ki_protection
     def release(self):
