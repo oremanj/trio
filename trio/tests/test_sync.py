@@ -5,6 +5,7 @@ import weakref
 from ..testing import wait_all_tasks_blocked, assert_checkpoints
 
 from .. import _core
+from .._core.tests.tutil import gc_collect_harder
 from .. import _timeouts
 from .._timeouts import sleep_forever, move_on_after
 from .._sync import *
@@ -170,11 +171,13 @@ async def test_CapacityLimiter_memleak_548():
     async with _core.open_nursery() as n:
         n.start_soon(limiter.acquire)
         await wait_all_tasks_blocked()  # give it a chance to run the task
+        child_task_ref = weakref.ref(next(iter(n.child_tasks)))
         n.cancel_scope.cancel()
 
-    # if this is 1, the acquire call (despite being killed) is still there in the task, and will
-    # leak memory all the while the limiter is active
-    assert len(limiter._pending_borrowers) == 0
+    # make sure the task isn't still being pinned in memory
+    del n
+    gc_collect_harder()
+    assert child_task_ref() is None
 
 
 async def test_Semaphore():

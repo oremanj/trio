@@ -4,23 +4,246 @@ import outcome
 import types
 import warnings
 import weakref
-from contextlib import closing
-from functools import wraps, update_wrapper
+from contextlib import closing, ExitStack, contextmanager
+from functools import wraps, update_wrapper, partial
 from .. import _core
 from ._ki import LOCALS_KEY_KI_PROTECTION_ENABLED, enable_ki_protection
 
 
-__all__ = ["operation", "get_operation"]
+__all__ = ["atomic_operation", "select"]
 
 
 class SpuriousWakeup(BaseException):
-    pass
+    """Internal exception thrown to implement operation retry."""
+
+
+def raise_through_opiter(opiter, exc, *, may_swallow=False):
+    try:
+        opiter.throw(type(exc), exc, exc.__traceback__)
+    except (() if may_swallow else StopIteration):
+        raise TypeError("operation function swallowed exception") from exc
+    try:
+        opiter.close()
+    finally:
+        raise TypeError("operation function ignored exception") from exc
+
+
+@attr.s(repr=False, cmp=False, slots=True)
+class CompletionHandle:
+    _opiter = attr.ib()
+    _parent_handle = attr.ib()
+    _close_children_fn = attr.ib()
+    custom_sleep_data = attr.ib(default=None)
+
+    def _name(self):
+        return (
+            self._parent_handle._name()
+            + " -> " + self._opiter.gi_code.co_name
+        )
+
+    def __repr__(self):
+        return "<operation completion handle at {:#x}, for {}>".format(
+            id(self), self._name()
+        )
+
+    @enable_ki_protection
+    def complete(self, inner_value=None):
+        try:
+            self._close_children_fn()
+        except BaseException as ex:
+            self.fail(ex)
+            return
+
+        try:
+            self._opiter.send(inner_value)
+            raise_through_opiter(
+                self._opiter,
+                TypeError("operation function yielded too many times"),
+            )
+        except StopIteration as outer_result:
+            self._parent_handle.complete(outer_result.value)
+        except BaseException as outer_error:
+            self._parent_handle.fail(outer_error)
+
+    @enable_ki_protection
+    def fail(self, inner_error):
+        if isinstance(inner_error, type):
+            try:
+                inner_error = inner_error()
+            except BaseException as ex:
+                inner_error = TypeError(
+                    "operation {} completion fail() was called with an "
+                    "uninstantiable exception type {!r}"
+                    .format(self._name(), inner_error)
+                )
+                inner_error.__cause__ = ex
+        if not isinstance(inner_error, BaseException):
+            inner_error = TypeError(
+                "operation {} completion fail() was called with "
+                "{!r} which is not an exception type or value"
+                .format(self._name(), inner_error)
+            )
+
+        try:
+            self._close_children_fn()
+        except BaseException as ex:
+            ex.__context__ = inner_error
+            inner_error = ex
+
+        try:
+            raise_through_opiter(self._opiter, inner_error, may_swallow=True)
+        except StopIteration as outer_result:
+            self._parent_handle.complete(outer_result.value)
+        except BaseException as outer_error:
+            self._parent_handle.fail(outer_error)
+
+    def retry(self):
+        raise SpuriousWakeup
+
+    def add_async_cleanup(self, async_fn):
+        self._parent_handle.add_async_cleanup(async_fn)
+
+
+@attr.s(slots=True, repr=False)
+class Operation:
+    fn = attr.ib()
+    args = attr.ib()
+    kwargs = attr.ib()
+    _first_opiter = attr.ib(default=None, init=False, cmp=False)
+
+    def _name(self):
+        for attr in ("__qualname__", "__name__"):
+            try:
+                return getattr(self.fn, attr)
+            except AttributeError:
+                pass
+        else:
+            return repr(self.fn)
+
+    def __attrs_post_init__(self):
+        self._first_opiter = self()
+
+    def __repr__(self):
+        args = list(map(repr, self.args)) + [
+            "{}={!r}".format(*item) for item in self.kwargs.items()
+        ]
+        return "{}.operation({})".format(self._name(), ", ".join(args))
+
+    def __call__(self):
+        if self._first_opiter is not None:
+            opiter = self._first_opiter
+            self._first_opiter = None
+            return opiter
+
+        opiter = self.fn(*self.args, **self.kwargs)
+        if not inspect.isgenerator(opiter):
+            raise TypeError(
+                "{} must return a generator iterator, not {!r}"
+                .format(self._name(), type(opiter))
+            )
+        opiter.gi_frame.f_locals.setdefault(
+            LOCALS_KEY_KI_PROTECTION_ENABLED, True
+        )
+        return opiter
+
+    # make 'yield from foo.operation()' work
+    __iter__ = __call__
+
+
+def get_opiter(operation):
+    if isinstance(operation, Operation):
+        return operation()
+    if (
+        inspect.iscoroutine(operation)
+        and operation.cr_code is perform_operation.__code__
+    ):
+        operation = operation.cr_frame.f_locals["operation"]
+        raise TypeError(
+            "use {0}.operation(...), not {0}(...)".format(
+                operation._name()
+            )
+        )
+    raise TypeError(
+        "need an operation, not {!r}".format(type(operation).__qualname__)
+    )
+
+
+@attr.s
+class ClosingStack:
+    _exit_stack = attr.ib(factory=ExitStack)
+    _items = attr.ib(factory=list)
+
+    def push(self, item):
+        self._exit_stack.callback(item.close)
+        self._items.append(item)
+        return item
+
+    def close(self):
+        del self._items[:]
+        self._exit_stack.close()
+
+    def close_from(self, index):
+        with ExitStack() as stack:
+            for item in self._items[index:]:
+                stack.callback(item.close)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return self._exit_stack.__exit__(*exc)
+
+    def __len__(self):
+        return len(self._items)
+
+    def __getitem__(self, index):
+        return self._items[index]
+
+
+def attempt_operation(opiter, opiter_stack):
+    try:
+        sub_operation = opiter.send(None)
+    except StopIteration as ex:
+        return ex.value
+
+    opiter_stack.push(opiter)
+    if sub_operation is None:
+        raise _core.WouldBlock
+
+    try:
+        sub_opiter = get_opiter(sub_operation)
+    except Exception as ex:
+        raise_through_opiter(opiter, ex)
+
+    return attempt_operation(sub_opiter, opiter_stack)
+
+
+def publish_operation(handle, opiter_stack):
+    for idx, opiter in enumerate(opiter_stack):
+        handle = CompletionHandle(
+            opiter, handle, partial(opiter_stack.close_from, idx + 1)
+        )
+        try:
+            second_yield = opiter.send(handle)
+        except StopIteration as ex:
+            raise TypeError(
+                "operation function yielded too few times"
+            ) from ex
+        if second_yield is not None:
+            raise_through_opiter(
+                opiter,
+                TypeError(
+                    "operation function yielded non-None value {!r} "
+                    "at its second yield point".format(second_yield)
+                ),
+            )
 
 
 @attr.s(cmp=False, slots=True)
 class RootHandle:
     sleeping_task = attr.ib(default=None)
     completed = attr.ib(default=False)
+    async_cleanup_fns = attr.ib(factory=list)
 
     def _name(self):
         return repr(self.sleeping_task)
@@ -46,224 +269,135 @@ class RootHandle:
     def fail(self, error):
         self.reschedule(outcome.Error(error))
 
-
-@attr.s(repr=False, cmp=False, slots=True)
-class CompletionHandle:
-    _this_operation = attr.ib()
-    _parent_handle = attr.ib()
-    custom_sleep_data = attr.ib(default=None)
-
-    def _name(self):
-        return (
-            self._parent_handle._name()
-            + " -> " + self._this_operation.gi_code.co_name
-        )
-
-    def __repr__(self):
-        return "<operation completion handle at {:#x}, for {}>".format(
-            id(self), self._name()
-        )
-
-    def handle_for_suboperation(self, sub_operation):
-        return CompletionHandle(sub_operation, self)
-
-    @enable_ki_protection
-    def complete(self, inner_value=None):
-        try:
-            self._this_operation.send(inner_value)
+    def add_async_cleanup(self, async_fn):
+        if self.sleeping_task is None or self.completed:
             raise TypeError(
-                "operation {!r} improperly yielded after its second "
-                "suspension point".format(self._this_operation)
+                "add_async_cleanup() must be called after the final "
+                "yield point in an operation function"
             )
-        except StopIteration as outer_result:
-            self._parent_handle.complete(outer_result.value)
-        except BaseException as outer_error:
-            self._parent_handle.fail(outer_error)
-
-    @enable_ki_protection
-    def fail(self, inner_error):
-        if isinstance(inner_error, type):
-            try:
-                inner_error = inner_error()
-            except BaseException as ex:
-                inner_error = TypeError(
-                    "operation {!r} completion fail() was called with an "
-                    "uninstantiable exception type {!r}"
-                    .format(self._this_operation, inner_error)
-                )
-                inner_error.__cause__ = ex
-        if not isinstance(inner_error, BaseException):
-            inner_error = TypeError(
-                "operation {!r} completion fail() was called with "
-                "{!r} which is not an exception type or value"
-                .format(self._this_operation, inner_error)
-            )
-
-        try:
-            self._this_operation.throw(
-                type(inner_error), inner_error, inner_error.__traceback__
-            )
-            raise TypeError(
-                "operation {!r} improperly yielded after its second "
-                "suspension point".format(self._this_operation)
-            )
-        except StopIteration as outer_result:
-            self._parent_handle.complete(outer_result.value)
-        except BaseException as outer_error:
-            self._parent_handle.fail(outer_error)
-
-    def retry(self):
-        raise SpuriousWakeup
+        self.async_cleanup_fns.append(async_fn)
 
 
-def qualname(fn):
-    for attr in ("__qualname__", "__name__"):
-        try:
-            return getattr(fn, attr)
-        except AttributeError:
-            pass
-    return repr(fn)
+# The fact that this argument is named "operation" is relied upon
+# to generate a better error message in get_opiter().
+async def perform_operation(operation):
+    did_block = False
+    await _core.checkpoint_if_cancelled()
+    try:
+        while True:
+            with ClosingStack() as opiter_stack:
+                try:
+                    return attempt_operation(
+                        get_opiter(operation), opiter_stack
+                    )
+                except _core.WouldBlock:
+                    pass
+
+                root_handle = RootHandle()
+                publish_operation(root_handle, opiter_stack)
+
+                def abort_fn(raise_cancel):
+                    try:
+                        opiter_stack.close()
+                    except BaseException as ex:
+                        root_handle.fail(ex)
+                        return _core.Abort.FAILED
+                    else:
+                        root_handle.completed = True
+                        root_handle.sleeping_task = None
+                        return _core.Abort.SUCCEEDED
+
+                root_handle.sleeping_task = _core.current_task()
+                did_block = True
+                try:
+                    return await _core.wait_task_rescheduled(abort_fn)
+                except SpuriousWakeup:
+                    pass
+                finally:
+                    if root_handle.async_cleanup_fns:
+                        with _core.CancelScope(shield=True):
+                            if len(root_handle.async_cleanup_fns) == 1:
+                                await root_handle.async_cleanup_fns[0]()
+                            else:
+                                async with _core.open_nursery() as nursery:
+                                    for afn in root_handle.async_cleanup_fns:
+                                        nursery.start_soon(afn)
+    finally:
+        if not did_block:
+            await _core.cancel_shielded_checkpoint()
 
 
 @attr.s(slots=True, repr=False)
-class OperationFactory:
-    fn = attr.ib()
-    args = attr.ib()
-    kwargs = attr.ib()
-    _first_operation = attr.ib(default=None, init=False, cmp=False)
-
-    def __attrs_post_init__(self):
-        self._first_operation = self()
+class BoundOperationMethod:
+    __func__ = attr.ib()
+    __self__ = attr.ib()
+    nowait = attr.ib()
+    operation = attr.ib()
 
     def __repr__(self):
-        args = list(map(repr, self.args)) + [
-            "{}={!r}".format(*item) for item in self.kwargs.items()
-        ]
-        return "{}.operation({})".format(qualname(self.fn), ", ".join(args))
+        return repr(types.MethodType(self.__func__, self.__self__))
 
-    def __call__(self):
-        if self._first_operation is not None:
-            operation = self._first_operation
-            self._first_operation = None
-            return operation
-
-        operation = self.fn(*self.args, **self.kwargs)
-        if not inspect.isgenerator(operation):
-            raise TypeError(
-                "operation {!r} must return a generator iterator, not {!r}"
-                .format(qualname(fn), type(operation))
-            )
-        operation.gi_frame.f_locals.setdefault(
-            LOCALS_KEY_KI_PROTECTION_ENABLED, True
-        )
-        return operation
-
-    __iter__ = __call__
+    def __call__(self, *args, **kwargs):
+        return self.__func__(self.__self__, *args, **kwargs)
 
 
-def _expect_yields_none(yielded, operation, description):
-    if yielded is not None:
-        raise TypeError(
-            "operation {!r} must only yield None, but we got {!r} instead "
-            "(at the {})".format(operation, yielded, description)
-        )
-
-
-def get_operation(factory):
-    if isinstance(factory, OperationFactory):
-        return factory()
-    if (
-        inspect.iscoroutine(factory)
-        and factory.cr_frame.f_code is perform_operation.__code__
-    ):
-        factory = factory.cr_frame.f_locals["operation_factory"]
-        raise TypeError(
-            "use {0}.operation(...), not {0}(...)".format(qualname(factory.fn))
-        )
-    raise TypeError(
-        "need an operation factory, not {!r}".format(qualname(type(factory)))
-    )
-
-
-def attempt_operation(operation):
-    try:
-        _expect_yields_none(
-            operation.send(None), operation, "first suspension point"
-        )
-    except StopIteration as ex:
-        return ex.value
-    else:
-        raise _core.WouldBlock
-
-
-# The fact that this argument is named "operation_factory" is relied upon
-# to generate a better error message in get_operation().
-async def perform_operation(operation_factory):
-    while True:
-        await _core.checkpoint_if_cancelled()
-        with closing(operation_factory()) as operation:
-            try:
-                potential_immediate_result = attempt_operation(operation)
-            except _core.WouldBlock:
-                pass
-            except:
-                await _core.cancel_shielded_checkpoint()
-                raise
-            else:
-                await _core.cancel_shielded_checkpoint()
-                return potential_immediate_result
-
-            root_handle = RootHandle()
-            completion_handle = CompletionHandle(operation, root_handle)
-            try:
-                try:
-                    _expect_yields_none(
-                        operation.send(completion_handle),
-                        operation,
-                        "second suspension point"
-                    )
-                except StopIteration as ex:
-                    raise TypeError(
-                        "@operation function {!r} should have yielded twice, "
-                        "but instead it returned after yielding once"
-                        .format(qualname(operation_factory.fn))
-                    ) from ex
-            except:
-                await _core.cancel_shielded_checkpoint()
-                raise
-
-            def abort_fn(raise_cancel):
-                try:
-                    operation.close()
-                except BaseException as ex:
-                    root_handle.fail(ex)
-                    return _core.Abort.FAILED
-                else:
-                    return _core.Abort.SUCCEEDED
-
-            root_handle.sleeping_task = _core.current_task()
-            try:
-                return await _core.wait_task_rescheduled(abort_fn)
-            except SpuriousWakeup:
-                pass
-
-
-class operation:
+class atomic_operation:
     def __init__(self, fn):
-        if not callable(fn):
-            raise TypeError("@operation must be used as a decorator")
+        self.__isabstractmethod__ = getattr(fn, "__isabstractmethod__", False)
+
+        if type(fn) is staticmethod:
+            self._bind = self._bind_static
+            fn = fn.__func__
+        elif type(fn) is classmethod:
+            self._bind = self._bind_class
+            fn = fn.__func__
+        elif type(fn) is types.FunctionType:
+            self._bind = self._bind_instance
+        elif not callable(fn):
+            raise TypeError("@atomic_operation must decorate a callable")
+        elif hasattr(fn, "__get__"):
+            raise TypeError(
+                "@atomic_operation doesn't support decorating a {!r} (need a "
+                "function, classmethod, staticmethod, or non-descriptor "
+                "callable)".format(type(fn))
+            )
+
         self._fn = fn
-        self._cache = weakref.WeakKeyDictionary()
         update_wrapper(self, self._fn, updated=())
-        self._unbound = self.__get__(None, None)
-        self.nowait = self._unbound.nowait
-        self.operation = self._unbound.operation
+        self._cache = {}
+
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            return perform_operation(Operation(fn, args, kwargs))
+
+        @wraps(fn)
+        def wrapper_nowait(*args, **kwargs):
+            operation = Operation(fn, args, kwargs)
+            with ClosingStack() as opiter_stack:
+                return attempt_operation(get_opiter(operation), opiter_stack)
+
+        @wraps(fn)
+        def wrapper_operation(*args, **kwargs):
+            return Operation(fn, args, kwargs)
+
+        # TODO: docstring
+
+        wrapper.nowait = wrapper_nowait
+        wrapper.nowait.__name__ += ".nowait"
+        wrapper.nowait.__qualname__ += ".nowait"
+        wrapper.operation = wrapper_operation
+        wrapper.operation.__name__ += ".operation"
+        wrapper.operation.__qualname__ += ".operation"
+
+        self._unbound = wrapper
+        self.nowait = wrapper_nowait
+        self.operation = wrapper_operation
 
     def __getattr__(self, attr):
         return getattr(self._fn, attr)
 
     def __eq__(self, other):
-        if isinstance(other, operation):
+        if isinstance(other, atomic_operation):
             return self._fn == other._fn
         return NotImplemented
 
@@ -273,40 +407,56 @@ class operation:
     def __call__(self, *args, **kwargs):
         return self._unbound(*args, **kwargs)
 
+    def _bind_instance(self, instance, owner):
+        if instance is None:
+            return self
+        return BoundOperationMethod(
+            self._unbound,
+            instance,
+            types.MethodType(self.nowait, instance),
+            types.MethodType(self.operation, instance),
+        )
+
+    def _bind_class(self, instance, owner):
+        return BoundOperationMethod(
+            self._unbound,
+            owner,
+            types.MethodType(self.nowait, owner),
+            types.MethodType(self.operation, owner),
+        )
+
+    def _bind_static(self, instance, owner):
+        return self
+
     def __get__(self, instance, owner):
+        # TODO: see if this cache is still giving us anything useful
         key = instance if instance is not None else owner
         try:
-            if key is not None:
-                return self._cache[key]
+            cached_result, key_ref = self._cache[id(key)]
         except KeyError:
             pass
-
-        if key is not None and hasattr(self._fn, "__get__"):
-            method = self._fn.__get__(instance, owner)
         else:
-            method = self._fn
+            if key_ref() is key:
+                return cached_result
+            del self._cache[id(key)]
+        result = self._bind(instance, owner)
+        self._cache[id(key)] = (result, weakref.ref(key))
+        return result
 
-        @wraps(self._fn)
-        def wrapper(*args, **kwargs):
-            return perform_operation(OperationFactory(method, args, kwargs))
 
-        @wraps(self._fn)
-        def wrapper_nowait(*args, **kwargs):
-            factory = OperationFactory(method, args, kwargs)
-            with closing(factory()) as operation:
-                return attempt_operation(operation)
+@atomic_operation
+def select(*operations):
+    with ClosingStack() as toplevel_stack:
+        for operation in operations:
+            branch_stack = toplevel_stack.push(ClosingStack())
+            try:
+                return attempt_operation(get_opiter(operation), branch_stack)
+            except _core.WouldBlock:
+                pass
 
-        @wraps(self._fn)
-        def wrapper_operation(*args, **kwargs):
-            return OperationFactory(method, args, kwargs)
+        handle = yield
 
-        wrapper.nowait = wrapper_nowait
-        wrapper.nowait.__name__ += ".nowait"
-        wrapper.nowait.__qualname__ += ".nowait"
-        wrapper.operation = wrapper_operation
-        wrapper.operation.__name__ += ".operation"
-        wrapper.operation.__qualname__ += ".operation"
+        for branch_stack in toplevel_stack:
+            publish_operation(handle, branch_stack)
 
-        if key is not None:
-            self._cache[key] = wrapper
-        return wrapper
+        return (yield)

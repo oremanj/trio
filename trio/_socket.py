@@ -343,8 +343,12 @@ def _make_simple_sock_method_wrapper(methname, wait_fn, maybe_avail=False):
     fn = getattr(_stdlib_socket.socket, methname)
 
     @_wraps(fn, assigned=("__name__",), updated=())
-    async def wrapper(self, *args, **kwargs):
-        return await self._nonblocking_helper(fn, args, kwargs, wait_fn)
+    def wrapper(self, *args, **kwargs):
+        return (
+            yield from self._nonblocking_helper.operation(
+                fn, args, kwargs, wait_fn
+            )
+        )
 
     wrapper.__doc__ = (
         """Like :meth:`socket.socket.{}`, but async.
@@ -356,7 +360,7 @@ def _make_simple_sock_method_wrapper(methname, wait_fn, maybe_avail=False):
             "Only available on platforms where :meth:`socket.socket.{}` "
             "is available.".format(methname)
         )
-    return wrapper
+    return _core.atomic_operation(wrapper)
 
 
 class SocketType:
@@ -555,7 +559,8 @@ class _SocketType(SocketType):
     async def _resolve_remote_address(self, address):
         return await self._resolve_address(address, 0)
 
-    async def _nonblocking_helper(self, fn, args, kwargs, wait_fn):
+    @_core.atomic_operation
+    def _nonblocking_helper(self, fn, args, kwargs, wait_fn):
         # We have to reconcile two conflicting goals:
         # - We want to make it look like we always blocked in doing these
         #   operations. The obvious way is to always do an IO wait before
@@ -574,18 +579,14 @@ class _SocketType(SocketType):
         # So, we have to call the function once, with the appropriate
         # cancellation/yielding sandwich if it succeeds, and if it gives
         # BlockingIOError *then* we fall back to IO wait.
-        #
-        # XX think if this can be combined with the similar logic for IOCP
-        # submission...
-        async with _try_sync():
+
+        try:
             return fn(self._sock, *args, **kwargs)
-        # First attempt raised BlockingIOError:
-        while True:
-            await wait_fn(self._sock)
-            try:
-                return fn(self._sock, *args, **kwargs)
-            except BlockingIOError:
-                pass
+        except BlockingIOError:
+            pass
+        handle = yield wait_fn.operation(self._sock)
+        yield
+        handle.retry()
 
     ################################################################
     # accept
@@ -595,11 +596,12 @@ class _SocketType(SocketType):
         "accept", _core.wait_socket_readable
     )
 
-    async def accept(self):
+    @_core.atomic_operation
+    def accept(self):
         """Like :meth:`socket.socket.accept`, but async.
 
         """
-        sock, addr = await self._accept()
+        sock, addr = yield from self._accept.operation()
         return from_stdlib_socket(sock), addr
 
     ################################################################

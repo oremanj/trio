@@ -606,7 +606,9 @@ class Nursery:
         popped = self._parent_task._child_nurseries.pop()
         assert popped is self
         if self._pending_excs:
-            return MultiError(self._pending_excs)
+            merged_exc = MultiError(self._pending_excs)
+            del self._pending_excs[:]
+            return merged_exc
 
     def start_soon(self, async_fn, *args, name=None):
         GLOBAL_RUN_CONTEXT.runner.spawn_impl(async_fn, args, self, name)
@@ -1571,12 +1573,14 @@ def run_impl(runner, async_fn, args):
                 for _ in range(CONTEXT_RUN_TB_FRAMES):
                     tb = tb.tb_next
                 final_outcome = Error(task_exc.with_traceback(tb))
+                del tb
 
             if final_outcome is not None:
                 # We can't call this directly inside the except: blocks above,
                 # because then the exceptions end up attaching themselves to
                 # other exceptions as __context__ in unwanted ways.
                 runner.task_exited(task, final_outcome)
+                del final_outcome
             else:
                 task._schedule_points += 1
                 if msg is CancelShieldedCheckpoint:
@@ -1609,6 +1613,7 @@ def run_impl(runner, async_fn, args):
                     # the way we're hoping. So instead we abandon this task
                     # and propagate the exception into the task's spawner.
                     runner.task_exited(task, Error(exc))
+                del msg
 
             if runner.instruments:
                 runner.instrument("after_task_step", task)
@@ -1747,8 +1752,13 @@ def _generate_method_wrappers(cls, path_to_instance):
                 "LOCALS_KEY_KI_PROTECTION_ENABLED":
                     LOCALS_KEY_KI_PROTECTION_ENABLED
             }
-            exec(_WRAPPER_TEMPLATE.format(path_to_instance, methname), ns)
-            wrapper = ns["wrapper"]
+
+            def create_wrapper(suffix):
+                suffixed = methname + suffix
+                exec(_WRAPPER_TEMPLATE.format(path_to_instance, suffixed), ns)
+                return ns.pop("wrapper")
+
+            wrapper = create_wrapper("")
             # 'fn' is the *unbound* version of the method, but our exported
             # function has the same API as the *bound* version of the
             # method. So create a dummy bound method object:
@@ -1757,6 +1767,17 @@ def _generate_method_wrappers(cls, path_to_instance):
             # Then set exported function's metadata to match it:
             from functools import update_wrapper
             update_wrapper(wrapper, bound_fn)
+
+            # If the method being looked up is an @atomic_operation, propagate
+            # the .nowait and .operation variants too.
+            if isinstance(fn, _core.atomic_operation):
+                wrapper.nowait = create_wrapper(".nowait")
+                wrapper.operation = create_wrapper(".operation")
+                update_wrapper(wrapper.nowait, MethodType(fn.nowait, object()))
+                update_wrapper(
+                    wrapper.operation, MethodType(fn.operation, object())
+                )
+
             # And finally export it:
             globals()[methname] = wrapper
             __all__.append(methname)

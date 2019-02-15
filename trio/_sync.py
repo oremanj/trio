@@ -61,7 +61,7 @@ class Event:
         """
         self._flag = False
 
-    @_core.operation
+    @_core.atomic_operation
     def wait(self):
         """Block until the internal flag value becomes True.
 
@@ -168,8 +168,6 @@ class CapacityLimiter:
     def __init__(self, total_tokens):
         self._lot = _core.ParkingLot()
         self._borrowers = set()
-        # Maps tasks attempting to acquire -> borrower, to handle on-behalf-of
-        self._pending_borrowers = {}
         # invoke the property setter for validation
         self.total_tokens = total_tokens
         assert self._total_tokens == total_tokens
@@ -210,8 +208,7 @@ class CapacityLimiter:
 
     def _wake_waiters(self):
         available = self._total_tokens - len(self._borrowers)
-        for woken in self._lot.unpark(count=available):
-            self._borrowers.add(self._pending_borrowers.pop(woken))
+        self._lot.unpark(count=available)
 
     @property
     def borrowed_tokens(self):
@@ -227,7 +224,7 @@ class CapacityLimiter:
         """
         return self.total_tokens - self.borrowed_tokens
 
-    @_core.operation
+    @_core.atomic_operation
     def acquire(self):
         """Borrow a token from the sack, blocking if necessary.
 
@@ -238,7 +235,7 @@ class CapacityLimiter:
         """
         yield from self.acquire_on_behalf_of.operation(_core.current_task())
 
-    @_core.operation
+    @_core.atomic_operation
     def acquire_on_behalf_of(self, borrower):
         """Borrow a token from the sack on behalf of ``borrower``, blocking if
         necessary.
@@ -261,21 +258,9 @@ class CapacityLimiter:
                 "this borrower is already holding one of this "
                 "CapacityLimiter's tokens"
             )
-        if len(self._borrowers) < self._total_tokens and not self._lot:
-            self._borrowers.add(borrower)
-            return
-
-        task = _core.current_task()
-        if task in self._pending_borrowers:
-            raise RuntimeError(
-                "can't select on two acquisitions from the same CapacityLimiter"
-            )
-        self._pending_borrowers[task] = borrower
-        try:
+        if len(self._borrowers) >= self._total_tokens or self._lot:
             yield from self._lot.park.operation()
-        except:
-            self._pending_borrowers.pop(task)
-            raise
+        self._borrowers.add(borrower)
 
     def acquire_nowait(self):
         # TODO deprecation
@@ -415,7 +400,7 @@ class Semaphore:
         # TODO deprecation
         return self.acquire.nowait()
 
-    @_core.operation
+    @_core.atomic_operation
     def acquire(self):
         """Decrement the semaphore value, blocking if necessary to avoid
         letting it drop below zero.
@@ -508,7 +493,7 @@ class Lock:
         # TODO deprecation
         return self.acquire.nowait()
 
-    @_core.operation
+    @_core.atomic_operation
     def acquire(self):
         """Acquire the lock, blocking if necessary.
 
@@ -516,14 +501,13 @@ class Lock:
         task = _core.current_task()
         if self._owner is task:
             raise RuntimeError("attempt to re-acquire an already held Lock")
-        elif self._owner is None and not self._lot:
-            # No-one owns it
-            self._owner = task
-        else:
+        if self._owner is not None or self._lot:
+            # Wait to be granted the lock
             # NOTE: it's important that the contended acquire path is just
             # "_lot.park()", because that's how Condition.wait() acquires the
             # lock as well.
             yield from self._lot.park.operation()
+        self._owner = task
 
     @_core.enable_ki_protection
     def release(self):
@@ -537,7 +521,7 @@ class Lock:
         if task is not self._owner:
             raise RuntimeError("can't release a Lock you don't own")
         if self._lot:
-            (self._owner,) = self._lot.unpark(count=1)
+            self._lot.unpark(count=1)  # sets self._owner
         else:
             self._owner = None
 
@@ -663,19 +647,15 @@ class Condition:
         return self._lock.locked()
 
     def acquire_nowait(self):
-        """Attempt to acquire the underlying lock, without blocking.
+        # TODO deprecation
+        return self.acquire.nowait()
 
-        Raises:
-          WouldBlock: if the lock is currently held.
-
-        """
-        return self._lock.acquire_nowait()
-
-    async def acquire(self):
+    @_core.atomic_operation
+    def acquire(self):
         """Acquire the underlying lock, blocking if necessary.
 
         """
-        await self._lock.acquire()
+        yield from self._lock.acquire.operation()
 
     def release(self):
         """Release the underlying lock.
@@ -683,8 +663,8 @@ class Condition:
         """
         self._lock.release()
 
-    @_core.enable_ki_protection
-    async def wait(self):
+    @_core.atomic_operation
+    def wait(self):
         """Wait for another thread to call :meth:`notify` or
         :meth:`notify_all`.
 
@@ -707,16 +687,19 @@ class Condition:
           RuntimeError: if the calling task does not hold the lock.
 
         """
-        if _core.current_task() is not self._lock._owner:
+        task = _core.current_task()
+        if task is not self._lock._owner:
             raise RuntimeError("must hold the lock to wait")
-        self.release()
+
         # NOTE: we go to sleep on self._lot, but we'll wake up on
         # self._lock._lot. That's all that's required to acquire a Lock.
+        handle = yield self._lot.park.operation()
+        self.release()
         try:
-            await self._lot.park()
+            yield
+            self._lock._owner = task
         except:
-            with _core.CancelScope(shield=True):
-                await self.acquire()
+            handle.add_async_cleanup(self.acquire)
             raise
 
     def notify(self, n=1):

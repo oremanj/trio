@@ -120,7 +120,7 @@ class ParkingLot:
     # if we ever add the ability to repark while one's resuming place in
     # line (for false wakeups), then we could have it return a ticket that
     # abstracts the "place in line" concept.
-    @_core.operation
+    @_core.atomic_operation
     def park(self):
         """Park the current task until woken by a call to :meth:`unpark` or
         :meth:`unpark_all`.

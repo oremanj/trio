@@ -7,6 +7,7 @@ from outcome import Error, Value
 from . import _core
 from .abc import SendChannel, ReceiveChannel
 from ._util import generic_function
+from ._sync import Event
 
 
 @generic_function
@@ -82,10 +83,10 @@ class MemoryChannelState:
     # Counts of open endpoints using this state
     open_send_channels = attr.ib(default=0)
     open_receive_channels = attr.ib(default=0)
-    # {task: value}
-    send_tasks = attr.ib(factory=OrderedDict)
-    # {task: None}
-    receive_tasks = attr.ib(factory=OrderedDict)
+    # {handle: value}
+    send_ops = attr.ib(factory=OrderedDict)
+    # {handle: None}
+    receive_ops = attr.ib(factory=OrderedDict)
 
     def statistics(self):
         return ChannelStats(
@@ -93,19 +94,50 @@ class MemoryChannelState:
             max_buffer_size=self.max_buffer_size,
             open_send_channels=self.open_send_channels,
             open_receive_channels=self.open_receive_channels,
-            tasks_waiting_send=len(self.send_tasks),
-            tasks_waiting_receive=len(self.receive_tasks),
+            tasks_waiting_send=len(self.send_ops),
+            tasks_waiting_receive=len(self.receive_ops),
         )
 
+    @_core.atomic_operation
+    def send(self, value):
+        if not self.open_receive_channels:
+            raise _core.BrokenResourceError
+        if self.receive_ops:
+            assert not self.data
+            receive_handle = next(iter(self.receive_ops.keys()))
+            receive_handle.complete(value)
+        elif len(self.data) < self.max_buffer_size:
+            self.data.append(value)
+        else:
+            send_handle = yield
+            self.send_ops[send_handle] = value
+            try:
+                yield
+            finally:
+                del self.send_ops[send_handle]
+
+    @_core.atomic_operation
+    def receive(self):
+        if self.send_ops:
+            send_handle, value = next(iter(self.send_ops.items()))
+            send_handle.complete()
+            self.data.append(value)
+            # Fall through
+        if self.data:
+            return self.data.popleft()
+        if not self.open_send_channels:
+            raise _core.EndOfChannel
+        receive_handle = yield
+        self.receive_ops[receive_handle] = None
+        try:
+            return (yield)
+        finally:
+            del self.receive_ops[receive_handle]
 
 @attr.s(cmp=False, repr=False)
 class MemorySendChannel(SendChannel):
     _state = attr.ib()
-    _closed = attr.ib(default=False)
-    # This is just the tasks waiting on *this* object. As compared to
-    # self._state.send_tasks, which includes tasks from this object and
-    # all clones.
-    _tasks = attr.ib(factory=set)
+    _closed = attr.ib(factory=Event)
 
     def __attrs_post_init__(self):
         self._state.open_send_channels += 1
@@ -117,80 +149,51 @@ class MemorySendChannel(SendChannel):
             )
         )
 
+    @_core.atomic_operation
+    def _fail_when_closed(self):
+        yield from self._closed.wait.operation()
+        raise _core.ClosedResourceError
+
     def statistics(self):
         # XX should we also report statistics specific to this object?
         return self._state.statistics()
 
-    @_core.enable_ki_protection
+    @_core.atomic_operation
+    def send(self, value):
+        yield from _core.select.operation(
+            self._fail_when_closed.operation(),
+            self._state.send.operation(value),
+        )
+
     def send_nowait(self, value):
-        if self._closed:
-            raise _core.ClosedResourceError
-        if self._state.open_receive_channels == 0:
-            raise _core.BrokenResourceError
-        if self._state.receive_tasks:
-            assert not self._state.data
-            task, _ = self._state.receive_tasks.popitem(last=False)
-            task.custom_sleep_data._tasks.remove(task)
-            _core.reschedule(task, Value(value))
-        elif len(self._state.data) < self._state.max_buffer_size:
-            self._state.data.append(value)
-        else:
-            raise _core.WouldBlock
-
-    @_core.enable_ki_protection
-    async def send(self, value):
-        await _core.checkpoint_if_cancelled()
-        try:
-            self.send_nowait(value)
-        except _core.WouldBlock:
-            pass
-        else:
-            await _core.cancel_shielded_checkpoint()
-            return
-
-        task = _core.current_task()
-        self._tasks.add(task)
-        self._state.send_tasks[task] = value
-        task.custom_sleep_data = self
-
-        def abort_fn(_):
-            self._tasks.remove(task)
-            del self._state.send_tasks[task]
-            return _core.Abort.SUCCEEDED
-
-        await _core.wait_task_rescheduled(abort_fn)
+        # TODO deprecation
+        self.send.nowait(value)
 
     @_core.enable_ki_protection
     def clone(self):
-        if self._closed:
+        if self._closed.is_set():
             raise _core.ClosedResourceError
         return MemorySendChannel(self._state)
 
     @_core.enable_ki_protection
     async def aclose(self):
-        if self._closed:
+        if self._closed.is_set():
             await _core.checkpoint()
             return
-        self._closed = True
-        for task in self._tasks:
-            _core.reschedule(task, Error(_core.ClosedResourceError()))
-            del self._state.send_tasks[task]
-        self._tasks.clear()
+        self._closed.set()
         self._state.open_send_channels -= 1
         if self._state.open_send_channels == 0:
-            assert not self._state.send_tasks
-            for task in self._state.receive_tasks:
-                task.custom_sleep_data._tasks.remove(task)
-                _core.reschedule(task, Error(_core.EndOfChannel()))
-            self._state.receive_tasks.clear()
+            assert not self._state.send_ops
+            while self._state.receive_ops:
+                handle = next(iter(self._state.receive_ops.keys()))
+                handle.fail(_core.EndOfChannel)
         await _core.checkpoint()
 
 
 @attr.s(cmp=False, repr=False)
 class MemoryReceiveChannel(ReceiveChannel):
     _state = attr.ib()
-    _closed = attr.ib(default=False)
-    _tasks = attr.ib(factory=set)
+    _closed = attr.ib(factory=Event)
 
     def __attrs_post_init__(self):
         self._state.open_receive_channels += 1
@@ -203,67 +206,41 @@ class MemoryReceiveChannel(ReceiveChannel):
             id(self), id(self._state)
         )
 
-    @_core.enable_ki_protection
+    @_core.atomic_operation
+    def _fail_when_closed(self):
+        yield from self._closed.wait.operation()
+        raise _core.ClosedResourceError
+
+    @_core.atomic_operation
+    def receive(self):
+        return (
+            yield from _core.select.operation(
+                self._fail_when_closed.operation(),
+                self._state.receive.operation(),
+            )
+        )
+
     def receive_nowait(self):
-        if self._closed:
-            raise _core.ClosedResourceError
-        if self._state.send_tasks:
-            task, value = self._state.send_tasks.popitem(last=False)
-            task.custom_sleep_data._tasks.remove(task)
-            _core.reschedule(task)
-            self._state.data.append(value)
-            # Fall through
-        if self._state.data:
-            return self._state.data.popleft()
-        if not self._state.open_send_channels:
-            raise _core.EndOfChannel
-        raise _core.WouldBlock
-
-    @_core.enable_ki_protection
-    async def receive(self):
-        await _core.checkpoint_if_cancelled()
-        try:
-            value = self.receive_nowait()
-        except _core.WouldBlock:
-            pass
-        else:
-            await _core.cancel_shielded_checkpoint()
-            return value
-
-        task = _core.current_task()
-        self._tasks.add(task)
-        self._state.receive_tasks[task] = None
-        task.custom_sleep_data = self
-
-        def abort_fn(_):
-            self._tasks.remove(task)
-            del self._state.receive_tasks[task]
-            return _core.Abort.SUCCEEDED
-
-        return await _core.wait_task_rescheduled(abort_fn)
+        # TODO deprecation
+        return self.receive.nowait()
 
     @_core.enable_ki_protection
     def clone(self):
-        if self._closed:
+        if self._closed.is_set():
             raise _core.ClosedResourceError
         return MemoryReceiveChannel(self._state)
 
     @_core.enable_ki_protection
     async def aclose(self):
-        if self._closed:
+        if self._closed.is_set():
             await _core.checkpoint()
             return
-        self._closed = True
-        for task in self._tasks:
-            _core.reschedule(task, Error(_core.ClosedResourceError()))
-            del self._state.receive_tasks[task]
-        self._tasks.clear()
+        self._closed.set()
         self._state.open_receive_channels -= 1
         if self._state.open_receive_channels == 0:
-            assert not self._state.receive_tasks
-            for task in self._state.send_tasks:
-                task.custom_sleep_data._tasks.remove(task)
-                _core.reschedule(task, Error(_core.BrokenResourceError()))
-            self._state.send_tasks.clear()
+            assert not self._state.receive_ops
+            while self._state.send_ops:
+                handle = next(iter(self._state.send_ops.keys()))
+                handle.fail(_core.BrokenResourceError)
             self._state.data.clear()
         await _core.checkpoint()

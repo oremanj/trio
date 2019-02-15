@@ -15,14 +15,14 @@ class _EpollStatistics:
 
 @attr.s(slots=True, cmp=False, hash=False)
 class EpollWaiters:
-    read_task = attr.ib(default=None)
-    write_task = attr.ib(default=None)
+    read_handle = attr.ib(default=None)
+    write_handle = attr.ib(default=None)
 
     def flags(self):
         flags = 0
-        if self.read_task is not None:
+        if self.read_handle is not None:
             flags |= select.EPOLLIN
-        if self.write_task is not None:
+        if self.write_handle is not None:
             flags |= select.EPOLLOUT
         if not flags:
             return None
@@ -50,9 +50,9 @@ class EpollIOManager:
         tasks_waiting_read = 0
         tasks_waiting_write = 0
         for waiter in self._registered.values():
-            if waiter.read_task is not None:
+            if waiter.read_handle is not None:
                 tasks_waiting_read += 1
-            if waiter.write_task is not None:
+            if waiter.write_handle is not None:
                 tasks_waiting_write += 1
         return _EpollStatistics(
             tasks_waiting_read=tasks_waiting_read,
@@ -72,13 +72,10 @@ class EpollIOManager:
             # Clever hack stolen from selectors.EpollSelector: an event
             # with EPOLLHUP or EPOLLERR flags wakes both readers and
             # writers.
-            if flags & ~select.EPOLLIN and waiters.write_task is not None:
-                _core.reschedule(waiters.write_task)
-                waiters.write_task = None
-            if flags & ~select.EPOLLOUT and waiters.read_task is not None:
-                _core.reschedule(waiters.read_task)
-                waiters.read_task = None
-            self._update_registrations(fd, True)
+            if flags & ~select.EPOLLIN and waiters.write_handle is not None:
+                waiters.write_handle.complete()
+            if flags & ~select.EPOLLOUT and waiters.read_handle is not None:
+                waiters.read_handle.complete()
 
     def _update_registrations(self, fd, currently_registered):
         waiters = self._registered[fd]
@@ -95,35 +92,37 @@ class EpollIOManager:
 
     # Public (hazmat) API:
 
-    async def _epoll_wait(self, fd, attr_name):
+    def _epoll_wait(self, fd, attr_name):
         if not isinstance(fd, int):
             fd = fd.fileno()
+        handle = yield
+
         currently_registered = (fd in self._registered)
         if not currently_registered:
             self._registered[fd] = EpollWaiters()
         waiters = self._registered[fd]
         if getattr(waiters, attr_name) is not None:
-            await _core.checkpoint()
             raise _core.BusyResourceError(
                 "another task is already reading / writing this fd"
             )
-        setattr(waiters, attr_name, _core.current_task())
+        setattr(waiters, attr_name, handle)
         self._update_registrations(fd, currently_registered)
 
-        def abort(_):
-            setattr(self._registered[fd], attr_name, None)
+        try:
+            yield
+        finally:
+            setattr(waiters, attr_name, None)
             self._update_registrations(fd, True)
-            return _core.Abort.SUCCEEDED
-
-        await _core.wait_task_rescheduled(abort)
 
     @_public
-    async def wait_readable(self, fd):
-        await self._epoll_wait(fd, "read_task")
+    @_core.atomic_operation
+    def wait_readable(self, fd):
+        yield from self._epoll_wait(fd, "read_handle")
 
     @_public
-    async def wait_writable(self, fd):
-        await self._epoll_wait(fd, "write_task")
+    @_core.atomic_operation
+    def wait_writable(self, fd):
+        yield from self._epoll_wait(fd, "write_handle")
 
     @_public
     def notify_fd_close(self, fd):
@@ -134,16 +133,12 @@ class EpollIOManager:
 
         waiters = self._registered[fd]
 
-        def interrupt(task):
+        def interrupt(handle):
             exc = _core.ClosedResourceError("another task closed this fd")
-            _core.reschedule(task, outcome.Error(exc))
+            handle.fail(exc)
 
-        if waiters.write_task is not None:
-            interrupt(waiters.write_task)
-            waiters.write_task = None
+        if waiters.write_handle is not None:
+            interrupt(waiters.write_handle)
 
-        if waiters.read_task is not None:
-            interrupt(waiters.read_task)
-            waiters.read_task = None
-
-        self._update_registrations(fd, True)
+        if waiters.read_handle is not None:
+            interrupt(waiters.read_handle)
