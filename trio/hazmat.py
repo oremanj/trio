@@ -20,8 +20,7 @@ from ._core import (
     current_statistics, reschedule, remove_instrument, add_instrument,
     current_clock, current_root_task, checkpoint_if_cancelled,
     spawn_system_task, wait_socket_readable, wait_socket_writable,
-    notify_socket_close, operation, as_operation, attempt_operation,
-    perform_operation
+    notify_socket_close, operation, get_operation
 )
 
 # Unix-specific symbols

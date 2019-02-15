@@ -35,9 +35,7 @@ from ._traps import (
     reattach_detached_coroutine_object
 )
 
-from ._operation import (
-    operation, as_operation, attempt_operation, perform_operation
-)
+from ._operation import operation, get_operation
 
 from ._entry_queue import TrioToken
 
