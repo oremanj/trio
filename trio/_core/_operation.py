@@ -18,6 +18,28 @@ class SpuriousWakeup(BaseException):
 
 
 def raise_through_opiter(opiter, exc, *, may_swallow=False):
+    """Raise ``exc``, by throwing it into ``opiter`` with the expectation
+    that it will propagate out. This serves to include in the traceback
+    of ``exc`` the location at which ``opiter`` was suspended, and
+    is appropriate for exceptions relating to misbehavior of the
+    operation function.
+
+    Args:
+      opiter: The operation iterator (or any generator iterator) to
+          throw the exception into.
+      exc: The exception to throw.
+      may_swallow: If True, ``opiter`` is allowed to respond to the
+          exception by returning normally (raising :exc:`StopIteration`).
+          Otherwise, such a response will be converted into a
+          :exc:`RuntimeError`.
+
+    Raises:
+      ``exc``, or another exception that ``opiter`` raised in its place,
+      or :exc:`RuntimeError` if ``opiter`` responded to ``exc`` by yielding
+      again or (if ``may_swallow`` is its default of False) by
+      returning normally.
+
+    """
     try:
         opiter.throw(type(exc), exc, exc.__traceback__)
     except (() if may_swallow else StopIteration):
@@ -30,6 +52,11 @@ def raise_through_opiter(opiter, exc, *, may_swallow=False):
 
 @attr.s(repr=False, cmp=False, slots=True)
 class CompletionHandle:
+    """A representation of the ability to complete an operation.
+
+    Each individual operation gets its own ...
+    """
+
     _opiter = attr.ib()
     _parent_handle = attr.ib()
     _close_children_fn = attr.ib()
