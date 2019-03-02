@@ -140,7 +140,7 @@ class WindowsIOManager:
         # register_wiht_iocp.
         self._completion_key_counter = itertools.count(2)
 
-        # {stdlib socket object: task}
+        # {stdlib socket object: operation handle}
         # except that wakeup socket is mapped to None
         self._socket_waiters = {"read": {}, "write": {}}
         self._main_thread_waker = WakeupSocketpair()
@@ -191,15 +191,11 @@ class WindowsIOManager:
         # If there are events queued from the IOCP thread, then the timeout is
         # implicitly reduced to 0 b/c the wakeup socket has pending data in
         # it.
-        def socket_ready(what, sock, result):
-            task = self._socket_waiters[what].pop(sock)
-            _core.reschedule(task, result)
-
         def socket_check(what, sock):
             try:
                 select([sock], [sock], [sock], 0)
             except OSError as exc:
-                socket_ready(what, sock, outcome.Error(exc))
+                self._socket_waiters[what][sock].fail(exc)
 
         def do_select():
             r_waiting = self._socket_waiters["read"]
@@ -217,15 +213,15 @@ class WindowsIOManager:
             # Some socket was closed or similar. Track it down and get rid of
             # it.
             for what in ["read", "write"]:
-                for sock in self._socket_waiters[what]:
+                for sock in list(self._socket_waiters[what]):
                     socket_check(what, sock)
             r, w = do_select()
 
         for sock in r:
             if sock is not self._main_thread_waker.wakeup_sock:
-                socket_ready("read", sock, outcome.Value(None))
+                self._socket_waiters["read"][sock].complete()
         for sock in w:
-            socket_ready("write", sock, outcome.Value(None))
+            self._socket_waiters["write"][sock].complete()
 
         # Step 2: drain the wakeup socket.
         # This must be done before checking the IOCP queue.
@@ -429,30 +425,30 @@ class WindowsIOManager:
         finally:
             del self._completion_key_queues[key]
 
-    async def _wait_socket(self, which, sock):
+    @_core.atomic_operation
+    def _wait_socket(self, which, sock):
         if not isinstance(sock, int):
             sock = sock.fileno()
         if sock in self._socket_waiters[which]:
-            await _core.checkpoint()
             raise _core.BusyResourceError(
                 "another task is already waiting to {} this socket"
                 .format(which)
             )
-        self._socket_waiters[which][sock] = _core.current_task()
-
-        def abort(_):
+        self._socket_waiters[which][sock] = yield
+        try:
+            yield
+        finally:
             del self._socket_waiters[which][sock]
-            return _core.Abort.SUCCEEDED
-
-        await _core.wait_task_rescheduled(abort)
 
     @_public
-    async def wait_socket_readable(self, sock):
-        await self._wait_socket("read", sock)
+    @_core.atomic_operation
+    def wait_socket_readable(self, sock):
+        yield from self._wait_socket.operation("read", sock)
 
     @_public
-    async def wait_socket_writable(self, sock):
-        await self._wait_socket("write", sock)
+    @_core.atomic_operation
+    def wait_socket_writable(self, sock):
+        yield from self._wait_socket.operation("write", sock)
 
     @_public
     def notify_socket_close(self, sock):
@@ -460,11 +456,11 @@ class WindowsIOManager:
             sock = sock.fileno()
         for mode in ["read", "write"]:
             if sock in self._socket_waiters[mode]:
-                task = self._socket_waiters[mode].pop(sock)
-                exc = _core.ClosedResourceError(
-                    "another task closed this socket"
+                self._socket_waiters[mode][sock].fail(
+                    _core.ClosedResourceError(
+                        "another task closed this socket"
+                    )
                 )
-                _core.reschedule(task, outcome.Error(exc))
 
     async def _perform_overlapped(self, handle, submit_fn):
         # submit_fn(lpOverlapped) submits some I/O

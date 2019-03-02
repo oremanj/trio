@@ -55,12 +55,10 @@ class KqueueIOManager:
         for event in events:
             key = (event.ident, event.filter)
             receiver = self._registered[key]
-            if event.flags & select.KQ_EV_ONESHOT:
-                del self._registered[key]
-            if type(receiver) is _core.Task:
-                _core.reschedule(receiver, outcome.Value(event))
-            else:
+            if type(receiver) is _core.UnboundedQueue:
                 receiver.put_nowait(event)
+            else:
+                receiver.complete(event)
 
     # kevent registration is complicated -- e.g. aio submission can
     # implicitly perform a EV_ADD, and EVFILT_PROC with NOTE_TRACK will
@@ -94,45 +92,44 @@ class KqueueIOManager:
             del self._registered[key]
 
     @_public
-    async def wait_kevent(self, ident, filter, abort_func):
+    @_core.atomic_operation
+    def wait_kevent(self, ident, filter):
         key = (ident, filter)
         if key in self._registered:
-            await _core.checkpoint()
             raise _core.BusyResourceError(
                 "attempt to register multiple listeners for same "
                 "ident/filter pair"
             )
-        self._registered[key] = _core.current_task()
+        self._registered[key] = yield
+        try:
+            return (yield)
+        finally:
+            del self._registered[key]
 
-        def abort(raise_cancel):
-            r = abort_func(raise_cancel)
-            if r is _core.Abort.SUCCEEDED:
-                del self._registered[key]
-            return r
-
-        return await _core.wait_task_rescheduled(abort)
-
-    async def _wait_common(self, fd, filter):
+    @_core.atomic_operation
+    def _wait_common(self, fd, filter):
         if not isinstance(fd, int):
             fd = fd.fileno()
         flags = select.KQ_EV_ADD | select.KQ_EV_ONESHOT
         event = select.kevent(fd, filter, flags)
+        yield self.wait_kevent.operation(fd, filter)
         self._kqueue.control([event], 0)
-
-        def abort(_):
+        try:
+            return (yield)
+        except:
             event = select.kevent(fd, filter, select.KQ_EV_DELETE)
             self._kqueue.control([event], 0)
-            return _core.Abort.SUCCEEDED
-
-        await self.wait_kevent(fd, filter, abort)
+            raise
 
     @_public
-    async def wait_readable(self, fd):
-        await self._wait_common(fd, select.KQ_FILTER_READ)
+    @_core.atomic_operation
+    def wait_readable(self, fd):
+        yield from self._wait_common.operation(fd, select.KQ_FILTER_READ)
 
     @_public
-    async def wait_writable(self, fd):
-        await self._wait_common(fd, select.KQ_FILTER_WRITE)
+    @_core.atomic_operation
+    def wait_writable(self, fd):
+        yield from self._wait_common.operation(fd, select.KQ_FILTER_WRITE)
 
     @_public
     def notify_fd_close(self, fd):
@@ -146,15 +143,13 @@ class KqueueIOManager:
             if receiver is None:
                 continue
 
-            if type(receiver) is _core.Task:
-                event = select.kevent(fd, filter, select.KQ_EV_DELETE)
-                self._kqueue.control([event], 0)
-                exc = _core.ClosedResourceError("another task closed this fd")
-                _core.reschedule(receiver, outcome.Error(exc))
-                del self._registered[key]
-            else:
+            if type(receiver) is _core.UnboundedQueue:
                 # XX this is an interesting example of a case where being able
                 # to close a queue would be useful...
                 raise NotImplementedError(
                     "can't close an fd that monitor_kevent is using"
+                )
+            else:
+                receiver.fail(
+                    _core.ClosedResourceError("another task closed this fd")
                 )
