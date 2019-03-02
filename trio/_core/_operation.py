@@ -177,19 +177,51 @@ class Operation:
     __iter__ = __call__
 
 
+def is_operation_function(fn):
+    return (
+        callable(fn)
+        and callable(getattr(fn, "operation", None))
+        and callable(getattr(fn, "nowait", None))
+    )
+
+
 def get_opiter(operation):
+    # If 'something' is a @atomic_operation function, we detect:
     if isinstance(operation, Operation):
+        # operation = something.operation(...)
         return operation()
+    if is_operation_function(operation):
+        # operation = something
+        return get_opiter(operation.operation())
+    if (
+        isinstance(operation, partial)
+        and is_operation_function(operation.func)
+    ):
+        # operation = partial(something, ...)
+        return get_opiter(
+            operation.func.operation(*operation.args, **operation.keywords)
+        )
+    if (
+        isinstance(operation, tuple)
+        and operation and is_operation_function(operation[0])
+    ):
+        # operation = (something, ...)
+        return get_opiter(operation[0](*operation[1:]))
     if (
         inspect.iscoroutine(operation)
         and operation.cr_code is perform_operation.__code__
     ):
+        # operation = something(...) -- don't permit this, since it
+        # instills bad habits (calling async functions without
+        # 'await'), but do give a good error
         operation = operation.cr_frame.f_locals["operation"]
-        raise TypeError(
-            "use {0}.operation(...), not {0}(...)".format(
-                operation._name()
-            )
-        )
+        if operaption.kwargs:
+            use = "{0}.operation(...) or partial({0}, ...), not {0}(...)"
+        elif operation.args:
+            use = "{0}.operation(...) or ({0}, ...), not {0}(...)"
+        else:
+            use = "{0}.operation() or {0}, not {0}()"
+        raise TypeError(msg.format(operation._name))
     raise TypeError(
         "need an operation, not {!r}".format(type(operation).__qualname__)
     )
@@ -354,7 +386,7 @@ async def perform_operation(operation):
             await _core.cancel_shielded_checkpoint()
 
 
-@attr.s(slots=True, repr=False)
+@attr.s(slots=True, frozen=True, repr=False)
 class BoundOperationMethod:
     __func__ = attr.ib()
     __self__ = attr.ib()
