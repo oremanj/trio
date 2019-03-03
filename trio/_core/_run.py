@@ -1768,16 +1768,6 @@ def _generate_method_wrappers(cls, path_to_instance):
             from functools import update_wrapper
             update_wrapper(wrapper, bound_fn)
 
-            # If the method being looked up is an @atomic_operation, propagate
-            # the .nowait and .operation variants too.
-            if isinstance(fn, _core.atomic_operation):
-                wrapper.nowait = create_wrapper(".nowait")
-                wrapper.operation = create_wrapper(".operation")
-                update_wrapper(wrapper.nowait, MethodType(fn.nowait, object()))
-                update_wrapper(
-                    wrapper.operation, MethodType(fn.operation, object())
-                )
-
             # And finally export it:
             globals()[methname] = wrapper
             __all__.append(methname)

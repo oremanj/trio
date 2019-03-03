@@ -106,13 +106,12 @@ class KqueueIOManager:
         finally:
             del self._registered[key]
 
-    @_core.atomic_operation
     def _wait_common(self, fd, filter):
         if not isinstance(fd, int):
             fd = fd.fileno()
         flags = select.KQ_EV_ADD | select.KQ_EV_ONESHOT
         event = select.kevent(fd, filter, flags)
-        yield self.wait_kevent.operation(fd, filter)
+        yield self.wait_kevent(fd, filter)
         self._kqueue.control([event], 0)
         try:
             return (yield)
@@ -124,12 +123,12 @@ class KqueueIOManager:
     @_public
     @_core.atomic_operation
     def wait_readable(self, fd):
-        yield from self._wait_common.operation(fd, select.KQ_FILTER_READ)
+        yield from self._wait_common(fd, select.KQ_FILTER_READ)
 
     @_public
     @_core.atomic_operation
     def wait_writable(self, fd):
-        yield from self._wait_common.operation(fd, select.KQ_FILTER_WRITE)
+        yield from self._wait_common(fd, select.KQ_FILTER_WRITE)
 
     @_public
     def notify_fd_close(self, fd):

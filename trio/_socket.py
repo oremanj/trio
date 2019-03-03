@@ -344,11 +344,7 @@ def _make_simple_sock_method_wrapper(methname, wait_fn, maybe_avail=False):
 
     @_wraps(fn, assigned=("__name__",), updated=())
     def wrapper(self, *args, **kwargs):
-        return (
-            yield from self._nonblocking_helper.operation(
-                fn, args, kwargs, wait_fn
-            )
-        )
+        return (yield from self._nonblocking_helper(fn, args, kwargs, wait_fn))
 
     wrapper.__doc__ = (
         """Like :meth:`socket.socket.{}`, but async.
@@ -584,7 +580,7 @@ class _SocketType(SocketType):
             return fn(self._sock, *args, **kwargs)
         except BlockingIOError:
             pass
-        handle = yield wait_fn.operation(self._sock)
+        handle = yield wait_fn(self._sock)
         yield
         handle.retry()
 
@@ -601,7 +597,7 @@ class _SocketType(SocketType):
         """Like :meth:`socket.socket.accept`, but async.
 
         """
-        sock, addr = yield from self._accept.operation()
+        sock, addr = yield from self._accept()
         return from_stdlib_socket(sock), addr
 
     ################################################################

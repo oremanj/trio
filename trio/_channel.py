@@ -151,7 +151,7 @@ class MemorySendChannel(SendChannel):
 
     @_core.atomic_operation
     def _fail_when_closed(self):
-        yield from self._closed.wait.operation()
+        yield from self._closed.wait()
         raise _core.ClosedResourceError
 
     def statistics(self):
@@ -160,14 +160,13 @@ class MemorySendChannel(SendChannel):
 
     @_core.atomic_operation
     def send(self, value):
-        yield from _core.select.operation(
-            self._fail_when_closed.operation(),
-            self._state.send.operation(value),
+        yield from _core.select(
+            self._fail_when_closed(),
+            self._state.send(value),
         )
 
     def send_nowait(self, value):
-        # TODO deprecation
-        self.send.nowait(value)
+        self.send(value).attempt()
 
     @_core.enable_ki_protection
     def clone(self):
@@ -208,21 +207,20 @@ class MemoryReceiveChannel(ReceiveChannel):
 
     @_core.atomic_operation
     def _fail_when_closed(self):
-        yield from self._closed.wait.operation()
+        yield from self._closed.wait()
         raise _core.ClosedResourceError
 
     @_core.atomic_operation
     def receive(self):
         return (
-            yield from _core.select.operation(
-                self._fail_when_closed.operation(),
-                self._state.receive.operation(),
+            yield from _core.select(
+                self._fail_when_closed(),
+                self._state.receive(),
             )
         )
 
     def receive_nowait(self):
-        # TODO deprecation
-        return self.receive.nowait()
+        return self.receive().attempt()
 
     @_core.enable_ki_protection
     def clone(self):

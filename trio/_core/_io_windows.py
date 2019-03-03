@@ -443,12 +443,12 @@ class WindowsIOManager:
     @_public
     @_core.atomic_operation
     def wait_socket_readable(self, sock):
-        yield from self._wait_socket.operation("read", sock)
+        yield from self._wait_socket("read", sock)
 
     @_public
     @_core.atomic_operation
     def wait_socket_writable(self, sock):
-        yield from self._wait_socket.operation("write", sock)
+        yield from self._wait_socket("write", sock)
 
     @_public
     def notify_socket_close(self, sock):

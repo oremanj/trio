@@ -71,7 +71,7 @@ class Event:
         if self._flag:
             return
         else:
-            yield from self._lot.park.operation()
+            yield from self._lot.park()
 
     def statistics(self):
         """Return an object containing debugging information.
@@ -233,7 +233,7 @@ class CapacityLimiter:
               tokens.
 
         """
-        yield from self.acquire_on_behalf_of.operation(_core.current_task())
+        yield from self.acquire_on_behalf_of(_core.current_task())
 
     @_core.atomic_operation
     def acquire_on_behalf_of(self, borrower):
@@ -259,16 +259,14 @@ class CapacityLimiter:
                 "CapacityLimiter's tokens"
             )
         if len(self._borrowers) >= self._total_tokens or self._lot:
-            yield from self._lot.park.operation()
+            yield from self._lot.park()
         self._borrowers.add(borrower)
 
     def acquire_nowait(self):
-        # TODO deprecation
-        return self.acquire.nowait()
+        return self.acquire().attempt()
 
     def acquire_on_behalf_of_nowait(self, borrower):
-        # TODO deprecation
-        return self.acquire_on_behalf_of.nowait(borrower)
+        return self.acquire_on_behalf_of(borrower).attempt()
 
     @_core.enable_ki_protection
     def release(self):
@@ -397,8 +395,7 @@ class Semaphore:
         return self._max_value
 
     def acquire_nowait(self):
-        # TODO deprecation
-        return self.acquire.nowait()
+        return self.acquire().attempt()
 
     @_core.atomic_operation
     def acquire(self):
@@ -410,7 +407,7 @@ class Semaphore:
             assert not self._lot
             self._value -= 1
         else:
-            yield from self._lot.park.operation()
+            yield from self._lot.park()
 
     @_core.enable_ki_protection
     def release(self):
@@ -490,8 +487,7 @@ class Lock:
         return self._owner is not None
 
     def acquire_nowait(self):
-        # TODO deprecation
-        return self.acquire.nowait()
+        return self.acquire().attempt()
 
     @_core.atomic_operation
     def acquire(self):
@@ -506,7 +502,7 @@ class Lock:
             # NOTE: it's important that the contended acquire path is just
             # "_lot.park()", because that's how Condition.wait() acquires the
             # lock as well.
-            yield from self._lot.park.operation()
+            yield from self._lot.park()
         self._owner = task
 
     @_core.enable_ki_protection
@@ -648,14 +644,14 @@ class Condition:
 
     def acquire_nowait(self):
         # TODO deprecation
-        return self.acquire.nowait()
+        return self.acquire().attempt()
 
     @_core.atomic_operation
     def acquire(self):
         """Acquire the underlying lock, blocking if necessary.
 
         """
-        yield from self._lock.acquire.operation()
+        yield from self._lock.acquire()
 
     def release(self):
         """Release the underlying lock.
@@ -693,7 +689,7 @@ class Condition:
 
         # NOTE: we go to sleep on self._lot, but we'll wake up on
         # self._lock._lot. That's all that's required to acquire a Lock.
-        handle = yield self._lot.park.operation()
+        handle = yield self._lot.park()
         self.release()
         try:
             yield
