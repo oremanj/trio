@@ -1,5 +1,6 @@
 import attr
 import collections
+import contextvars
 import inspect
 import outcome
 import types
@@ -101,8 +102,8 @@ class CompletionHandle:
 
     # The completion handle that should receive the value or error
     # returned or raised by ``_opiter``. This may be anything that
-    # defines :meth:`complete`, :meth:`fail`, :meth:`retry`, and
-    # :meth:`add_async_cleanup` methods. Every
+    # defines :meth:`_complete`, :meth:`_fail`, :meth:`retry`, and
+    # :meth:`add_async_cleanup` methods.  Every
     # :class:`CompletionHandle` has a valid parent, so the root of the
     # tree created to perform an operation must be a different type;
     # see :class:`RootHandle` below.
@@ -112,6 +113,11 @@ class CompletionHandle:
     # or :meth:`fail` is called on this operation. It should close
     # all children of this operation.
     _close_children_fn = attr.ib()
+
+    # The contextvars context that was in effect when the completion
+    # handle was created.  We ensure that the completion executes in
+    # the same context.
+    _context = attr.ib(factory=contextvars.copy_context)
 
     #: Trio does not assign any meaning to this attribute; it's provided
     #: to allow for application-defined coordination between the sleeping
@@ -129,7 +135,7 @@ class CompletionHandle:
         )
 
     @enable_ki_protection
-    def complete(self, inner_value=None, *, _chain=False):
+    def complete(self, inner_value=None):
         """Complete this operation, sending the value ``inner_value`` in to
         its operation iterator at the final yield point. The resulting return
         value will be passed along to our parent handle's :meth:`complete`
@@ -145,18 +151,14 @@ class CompletionHandle:
           function.
 
         """
-        # The private _chain argument is true if this call is being made
-        # to propagate the result of a child operation's completion, so
-        # we know not to waste time calling _close_children_fn() and
-        # entering the sleeping task's context.
+        try:
+            self._context.run(self._close_children_fn)
+        except BaseException as ex:
+            self.fail(ex)
+        else:
+            self._context.run(self._complete, inner_value)
 
-        if not _chain:
-            try:
-                self._close_children_fn()
-            except BaseException as ex:
-                self.fail(ex)
-                return
-
+    def _complete(self, inner_value):
         try:
             self._opiter.send(inner_value)
             raise_through_opiter(
@@ -164,12 +166,12 @@ class CompletionHandle:
                 RuntimeError("operation function yielded too many times"),
             )
         except StopIteration as outer_result:
-            self._parent_handle.complete(outer_result.value, _chain=True)
+            self._parent_handle._complete(outer_result.value)
         except BaseException as outer_error:
-            self._parent_handle.fail(outer_error, _chain=True)
+            self._parent_handle._fail(outer_error)
 
     @enable_ki_protection
-    def fail(self, inner_error, *, _chain=False):
+    def fail(self, inner_error):
         """Fail this operation, throwing the exception ``inner_error`` in to
         its operation iterator at the final yield point. The exception that
         propagates out will be passed along to our parent handle's :meth:`fail`
@@ -206,19 +208,20 @@ class CompletionHandle:
                 .format(str(self), inner_error)
             )
 
-        if not _chain:
-            try:
-                self._close_children_fn()
-            except BaseException as ex:
-                ex.__context__ = inner_error
-                inner_error = ex
+        try:
+            self._context.run(self._close_children_fn)
+        except BaseException as ex:
+            ex.__context__ = inner_error
+            inner_error = ex
+        self._context.run(self._fail, inner_error)
 
+    def _fail(self, inner_error):
         try:
             raise_through_opiter(self._opiter, inner_error, may_swallow=True)
         except StopIteration as outer_result:
-            self._parent_handle.complete(outer_result.value, _chain=True)
+            self._parent_handle._complete(outer_result.value)
         except BaseException as outer_error:
-            self._parent_handle.fail(outer_error, _chain=True)
+            self._parent_handle._fail(outer_error)
 
     def retry(self):
         """Request that this operation be retried.
@@ -501,7 +504,7 @@ class Operation(collections.abc.Coroutine):
         func = self.func
 
         def combined(*args, **kwargs):
-            return transform(yield from func(*args, **kwargs))
+            return transform((yield from func(*args, **kwargs)))
 
         for attr in ("__qualname__", "__name__"):
             try:
@@ -641,7 +644,6 @@ class RootHandle:
     def __str__(self):
         return self.sleeping_task.name
 
-    @enable_ki_protection
     def reschedule(self, operation_outcome):
         if self.completed:
             raise RuntimeError("that operation has already been completed")
@@ -654,12 +656,10 @@ class RootHandle:
         self.completed = True
         self.sleeping_task = None
 
-    @enable_ki_protection
-    def complete(self, value):
+    def _complete(self, value):
         self.reschedule(outcome.Value(value))
 
-    @enable_ki_protection
-    def fail(self, error):
+    def _fail(self, error):
         self.reschedule(outcome.Error(error))
 
     def retry(self):
