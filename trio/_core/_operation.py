@@ -5,17 +5,13 @@ import inspect
 import outcome
 import types
 import weakref
-try:
-    from contextlib import AsyncExitStack
-except ImportError:
-    from async_exit_stack import AsyncExitStack
-from contextlib import closing, ExitStack, contextmanager
+from contextlib import closing, contextmanager
 from functools import wraps, update_wrapper, partial
 from .. import _core
 from ._ki import LOCALS_KEY_KI_PROTECTION_ENABLED, enable_ki_protection
 
 
-__all__ = ["atomic_operation", "select"]
+__all__ = ["atomic_operation", "reversible_operation", "select"]
 
 
 def raise_through_opiter(opiter, exc, *, may_swallow=False):
@@ -114,10 +110,10 @@ class CompletionHandle:
     # all children of this operation.
     _close_children_fn = attr.ib()
 
-    # The contextvars context that was in effect when the completion
-    # handle was created.  We ensure that the completion executes in
-    # the same context.
-    _context = attr.ib(factory=contextvars.copy_context)
+    # The task that this operation will ultimately wake up.
+    # We ensure that the unpublish portion of the operation
+    # executes in a context as if it were running as this task.
+    _task = attr.ib(factory=lambda: _core.current_task())
 
     #: Trio does not assign any meaning to this attribute; it's provided
     #: to allow for application-defined coordination between the sleeping
@@ -133,6 +129,23 @@ class CompletionHandle:
         return "<operation completion handle at {:#x}, for {}>".format(
             id(self), str(self)
         )
+
+    @contextmanager
+    def _fake_current_task(self):
+        waker = getattr(_core._run.GLOBAL_RUN_CONTEXT, "task", None)
+        if waker is self._task:
+            raise RuntimeError(
+                "can't complete an operation from within its own "
+                "operation function"
+            )
+        _core._run.GLOBAL_RUN_CONTEXT.task = self._task
+        try:
+            yield
+        finally:
+            if waker is not None:
+                _core._run.GLOBAL_RUN_CONTEXT.task = waker
+            else:
+                del _core._run.GLOBAL_RUN_CONTEXT.task
 
     @enable_ki_protection
     def complete(self, inner_value=None):
@@ -151,12 +164,15 @@ class CompletionHandle:
           function.
 
         """
-        try:
-            self._context.run(self._close_children_fn)
-        except BaseException as ex:
-            self.fail(ex)
-        else:
-            self._context.run(self._complete, inner_value)
+        with self._fake_current_task():
+            try:
+                self._task.context.run(self._close_children_fn)
+            except BaseException as ex:
+                exc = ex
+            else:
+                self._task.context.run(self._complete, inner_value)
+                return
+        self.fail(exc)
 
     def _complete(self, inner_value):
         try:
@@ -204,16 +220,16 @@ class CompletionHandle:
         if not isinstance(inner_error, BaseException):
             inner_error = TypeError(
                 "operation {} completion fail() was called with "
-                "{!r} which is not an exception type or value"
+                "{!r} which is not an exception"
                 .format(str(self), inner_error)
             )
 
-        try:
-            self._context.run(self._close_children_fn)
-        except BaseException as ex:
-            ex.__context__ = inner_error
-            inner_error = ex
-        self._context.run(self._fail, inner_error)
+        with self._fake_current_task():
+            try:
+                self._task.context.run(self._close_children_fn)
+            except BaseException as ex:
+                inner_error.__context__ = ex
+            self._task.context.run(self._fail, inner_error)
 
     def _fail(self, inner_error):
         try:
@@ -264,50 +280,42 @@ class CompletionHandle:
 
 
 @attr.s
-class ClosingStack:
-    """An ExitStack specialized for calling ``close()`` methods,
-    which also supports random access to the resources that are to be closed.
+class ClosingStack(list):
+    """A list of resources with ``close()`` methods, which supports closing
+    all of them with appropriate exception chaining (like ExitStack).
     """
-
-    _exit_stack = attr.ib(factory=ExitStack)
-    _items = attr.ib(factory=list)
-
-    def push(self, item):
-        """Push ``item`` onto the stack, so that ``item.close()`` will
-        be called when the ClosingStack is closed.
-        """
-        self._exit_stack.callback(item.close)
-        self._items.append(item)
-        return item
 
     def close(self):
         """Call the ``close()`` method of each resource that has been
         pushed onto the stack, in reverse of the order in which they
-        were pushed. After this call, the stack has no items left in it.
+        were pushed.
         """
-        del self._items[:]
-        self._exit_stack.close()
+        self.close_from(0)
 
     def close_from(self, index):
         """Call the ``close()`` method of each resource at or after
         index ``index`` in the stack, in reverse of the order in which
         they were pushed. The items remain on the stack.
         """
-        with ExitStack() as stack:
-            for item in self._items[index:]:
-                stack.callback(item.close)
+        last_exc = None
+        for item in reversed(self[index:]):
+            try:
+                try:
+                    if last_exc is not None:
+                        raise last_exc
+                finally:
+                    item.close()
+            except BaseException as new_exc:
+                last_exc = new_exc
+        if last_exc is not None:
+            raise last_exc
 
     def __enter__(self):
         return self
 
     def __exit__(self, *exc):
-        return self._exit_stack.__exit__(*exc)
-
-    def __len__(self):
-        return len(self._items)
-
-    def __getitem__(self, index):
-        return self._items[index]
+        self.close()
+        return False
 
 
 @attr.s(slots=True, repr=False)
@@ -402,6 +410,10 @@ class Operation(collections.abc.Coroutine):
         """
         return self._coro.__qualname__
 
+    @property
+    def __name__(self):
+        return self._coro.__name__
+
     @name.setter
     def name(self, value):
         self._coro.__qualname__ = value
@@ -474,7 +486,7 @@ class Operation(collections.abc.Coroutine):
         if not inspect.isgenerator(opiter):
             raise TypeError(
                 "{!r} must return a generator iterator, not {!r}"
-                .format(self.name, type(opiter))
+                .format(self.func, type(opiter))
             )
         opiter.gi_frame.f_locals.setdefault(
             LOCALS_KEY_KI_PROTECTION_ENABLED, True
@@ -567,7 +579,7 @@ def attempt_operation(opiter, opiter_stack):
     except StopIteration as ex:
         return ex.value
 
-    opiter_stack.push(opiter)
+    opiter_stack.append(opiter)
     if first_yield is None:
         raise _core.WouldBlock
     if not isinstance(first_yield, Operation):
@@ -609,7 +621,7 @@ def publish_operation(handle, opiter_stack):
         except StopIteration as ex:
             raise RuntimeError(
                 "operation function yielded too few times"
-            ) from ex
+            ) from None
         if second_yield is not None:
             raise_through_opiter(
                 opiter,
@@ -642,16 +654,11 @@ class RootHandle:
     async_cleanup_fns = attr.ib(factory=list)
 
     def __str__(self):
-        return self.sleeping_task.name
+        return getattr(self.sleeping_task, "name", "[setting up]")
 
     def reschedule(self, operation_outcome):
         if self.completed:
             raise RuntimeError("that operation has already been completed")
-        if self.sleeping_task is None:
-            raise RuntimeError(
-                "can't complete an operation from within its own operation "
-                "function"
-            )
         _core.reschedule(self.sleeping_task, operation_outcome)
         self.completed = True
         self.sleeping_task = None
@@ -730,10 +737,19 @@ async def perform_operation(operation):
                 finally:
                     if root_handle.async_cleanup_fns:
                         with _core.CancelScope(shield=True):
-                            stack = AsyncExitStack()
-                            for fn in reversed(root_handle.async_cleanup_fns):
-                                stack.push_async_callback(fn)
-                            await stack.aclose()
+                            last_exc = None
+                            for fn in root_handle.async_cleanup_fns:
+                                try:
+                                    await fn()
+                                except BaseException as new_exc:
+                                    if (
+                                        new_exc.__context__ is None
+                                        and last_exc is not None
+                                    ):
+                                        new_exc.__context__ = last_exc
+                                    last_exc = new_exc
+                            if last_exc is not None:
+                                raise last_exc
     finally:
         if not did_block:
             await _core.cancel_shielded_checkpoint()
@@ -814,7 +830,8 @@ def select(*operations):
         opiters = [iter(op) for op in operations]
 
         for opiter in opiters:
-            branch_stack = toplevel_stack.push(ClosingStack())
+            branch_stack = ClosingStack()
+            toplevel_stack.append(branch_stack)
             try:
                 return attempt_operation(opiter, branch_stack)
             except _core.WouldBlock:

@@ -400,7 +400,7 @@ async def test_Condition():
     # (Note that c.__aexit__ checks that we hold the lock as well)
     with _core.CancelScope() as scope:
         async with c:
-            scope.cancel()
+            scope.deadline = _core.current_time()
             try:
                 await c.wait()
             finally:
