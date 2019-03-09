@@ -1752,13 +1752,8 @@ def _generate_method_wrappers(cls, path_to_instance):
                 "LOCALS_KEY_KI_PROTECTION_ENABLED":
                     LOCALS_KEY_KI_PROTECTION_ENABLED
             }
-
-            def create_wrapper(suffix):
-                suffixed = methname + suffix
-                exec(_WRAPPER_TEMPLATE.format(path_to_instance, suffixed), ns)
-                return ns.pop("wrapper")
-
-            wrapper = create_wrapper("")
+            exec(_WRAPPER_TEMPLATE.format(path_to_instance, methname), ns)
+            wrapper = ns["wrapper"]
             # 'fn' is the *unbound* version of the method, but our exported
             # function has the same API as the *bound* version of the
             # method. So create a dummy bound method object:
@@ -1767,7 +1762,6 @@ def _generate_method_wrappers(cls, path_to_instance):
             # Then set exported function's metadata to match it:
             from functools import update_wrapper
             update_wrapper(wrapper, bound_fn)
-
             # And finally export it:
             globals()[methname] = wrapper
             __all__.append(methname)
