@@ -130,8 +130,11 @@ class CompletionHandle:
             id(self), str(self)
         )
 
-    @contextmanager
-    def _fake_current_task(self):
+    def _run_sync_in_original_task_context(self, sync_fn, *args):
+        """Call sync_fn(*args) in the context of self._task. That is,
+        calls to current_task() and accesses to context variables will
+        perform as if self._task were the running task.
+        """
         waker = getattr(_core._run.GLOBAL_RUN_CONTEXT, "task", None)
         if waker is self._task:
             raise RuntimeError(
@@ -140,7 +143,7 @@ class CompletionHandle:
             )
         _core._run.GLOBAL_RUN_CONTEXT.task = self._task
         try:
-            yield
+            self._task.context.run(sync_fn, *args)
         finally:
             if waker is not None:
                 _core._run.GLOBAL_RUN_CONTEXT.task = waker
@@ -164,17 +167,17 @@ class CompletionHandle:
           function.
 
         """
-        with self._fake_current_task():
-            try:
-                self._task.context.run(self._close_children_fn)
-            except BaseException as ex:
-                exc = ex
-            else:
-                self._task.context.run(self._complete, inner_value)
-                return
-        self.fail(exc)
+        self._run_sync_in_original_task_context(
+            self._complete, inner_value, True
+        )
 
-    def _complete(self, inner_value):
+    def _complete(self, inner_value, close_children_first=False):
+        if close_children_first:
+            try:
+                self._close_children_fn()
+            except BaseException as ex:
+                self._fail(ex)
+                return
         try:
             self._opiter.send(inner_value)
             raise_through_opiter(
@@ -223,15 +226,14 @@ class CompletionHandle:
                 "{!r} which is not an exception"
                 .format(str(self), inner_error)
             )
+        self._run_sync_in_original_task_context(self._fail, inner_error, True)
 
-        with self._fake_current_task():
+    def _fail(self, inner_error, close_children_first=False):
+        if close_children_first:
             try:
-                self._task.context.run(self._close_children_fn)
+                self._close_children_fn()
             except BaseException as ex:
                 inner_error.__context__ = ex
-            self._task.context.run(self._fail, inner_error)
-
-    def _fail(self, inner_error):
         try:
             raise_through_opiter(self._opiter, inner_error, may_swallow=True)
         except StopIteration as outer_result:
@@ -256,8 +258,8 @@ class CompletionHandle:
         """
         self._parent_handle.retry()
 
-    def add_async_cleanup(self, async_fn):
-        """Request that ``await async_fn()`` be invoked in the context
+    def add_async_cleanup(self, async_fn, *args):
+        """Request that ``await async_fn(*args)`` be invoked in the context
         of the task that's performing this operation, after the operation
         completes but before control progresses past it.
 
@@ -272,14 +274,14 @@ class CompletionHandle:
         order in which they were registered.
 
         Args:
-          async_fn: A zero-argument async function. (Use
-              :func:`functools.partial` if you need to pass arguments.)
+          async_fn: An async function.
+          args: Positional arguments for ``async_fn``. Use
+              :func:`functools.partial` if you need to pass keyword arguments.
 
         """
-        self._parent_handle.add_async_cleanup(async_fn)
+        self._parent_handle.add_async_cleanup(async_fn, *args)
 
 
-@attr.s
 class ClosingStack(list):
     """A list of resources with ``close()`` methods, which supports closing
     all of them with appropriate exception chaining (like ExitStack).
@@ -301,11 +303,19 @@ class ClosingStack(list):
         for item in reversed(self[index:]):
             try:
                 try:
+                    # Get last_exc as the __context__ of any exception raised
+                    # by item.close()
                     if last_exc is not None:
                         raise last_exc
                 finally:
                     item.close()
             except BaseException as new_exc:
+                if new_exc is last_exc:
+                    # If item.close() didn't raise, trim off the traceback
+                    # frame we just added.
+                    new_exc = new_exc.with_traceback(
+                        new_exc.__traceback__.tb_next
+                    )
                 last_exc = new_exc
         if last_exc is not None:
             raise last_exc
@@ -721,7 +731,7 @@ async def perform_operation(operation):
                     try:
                         opiter_stack.close()
                     except BaseException as ex:
-                        root_handle.fail(ex)
+                        root_handle._fail(ex)
                         return _core.Abort.FAILED
                     else:
                         root_handle.completed = True
